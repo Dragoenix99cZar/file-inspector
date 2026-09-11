@@ -1,4 +1,5 @@
 use eframe::egui;
+use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, File};
@@ -108,8 +109,8 @@ impl Default for AppConfig {
     }
 }
 
-const WIDTH: f32 = 900.0;
-const HEIGHT: f32 = 750.0;
+const WIDTH: f32 = 950.0;
+const HEIGHT: f32 = 780.0;
 
 fn main() -> Result<(), eframe::Error> {
     let options = eframe::NativeOptions {
@@ -120,7 +121,7 @@ fn main() -> Result<(), eframe::Error> {
     };
 
     eframe::run_native(
-        "Advanced File Inspector - egui",
+        "Advanced File Inspector - SQLite Edition",
         options,
         Box::new(|_cc| Ok(Box::new(FileInspectorApp::default()))),
     )
@@ -145,10 +146,8 @@ struct FileMetadataInfo {
 struct FileInspectorApp {
     current_file: Option<FileMetadataInfo>,
     status_message: String,
-    json_db_path: PathBuf,
+    db_path: PathBuf,
     config_path: PathBuf,
-    file_hash_map: HashMap<String, String>,
-    cached_index: HashMap<String, FileMetadataInfo>,
     config: AppConfig,
     tag_input_buffer: String,
     search_query: String,
@@ -158,7 +157,7 @@ impl Default for FileInspectorApp {
     fn default() -> Self {
         let exe_path = std::env::current_exe().unwrap_or_default();
         let exe_dir = exe_path.parent().unwrap_or_else(|| Path::new("."));
-        let json_db_path = exe_dir.join("file_index.json");
+        let db_path = exe_dir.join("file_inspector.db");
         let config_path = exe_dir.join("config.json");
 
         let config_content = fs::read_to_string(&config_path).expect(
@@ -167,35 +166,191 @@ impl Default for FileInspectorApp {
         let config: AppConfig = serde_json::from_str(&config_content)
             .expect("Failed to parse config.json. Check syntax.");
 
-        let cached_index = load_full_cache_from_json(&json_db_path);
-        let file_hash_map = cached_index
-            .iter()
-            .map(|(k, v)| (k.clone(), v.path.to_string_lossy().into_owned()))
-            .collect();
-
-        Self {
+        let app = Self {
             current_file: None,
-            status_message: format!("Loaded config from: {}", config_path.display()),
-            json_db_path,
+            status_message: format!(
+                "Loaded config & initialized SQLite DB: {}",
+                db_path.display()
+            ),
+            db_path,
             config_path,
-            file_hash_map,
-            cached_index,
             config,
             tag_input_buffer: String::new(),
             search_query: String::new(),
-        }
+        };
+
+        app.init_db();
+        app
     }
 }
 
 impl FileInspectorApp {
+    fn init_db(&self) {
+        if let Ok(conn) = Connection::open(&self.db_path) {
+            let _ = conn.execute(
+                "CREATE TABLE IF NOT EXISTS files (
+                    file_hash TEXT PRIMARY KEY,
+                    path TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    extension TEXT NOT NULL,
+                    size_bytes INTEGER NOT NULL,
+                    file_type TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    modified_at TEXT NOT NULL,
+                    extra_details TEXT NOT NULL,
+                    cached_at TEXT NOT NULL,
+                    is_directory BOOLEAN NOT NULL,
+                    tags TEXT NOT NULL
+                )",
+                [],
+            );
+        }
+    }
+
     fn reload_config(&mut self) {
         let content = fs::read_to_string(&self.config_path).unwrap_or_default();
         if let Ok(parsed) = serde_json::from_str::<AppConfig>(&content) {
             self.config = parsed;
             self.status_message =
                 "Configuration reloaded successfully from config.json.".to_string();
+        } else if let Ok(parsed) = serde_json::from_str(&content) {
+            self.config = parsed;
+            self.status_message =
+                "Configuration reloaded successfully from config file.".to_string();
         } else {
-            self.status_message = "Failed to reload config.json (syntax error).".to_string();
+            self.status_message = "Failed to reload configuration (syntax error).".to_string();
+        }
+    }
+
+    fn save_to_db(&self, info: &FileMetadataInfo) {
+        if let Ok(conn) = Connection::open(&self.db_path) {
+            let extra_json = serde_json::to_string(&info.extra_details).unwrap_or_default();
+            let tags_json = serde_json::to_string(&info.tags).unwrap_or_default();
+            let _ = conn.execute(
+                "INSERT OR REPLACE INTO files (file_hash, path, name, extension, size_bytes, file_type, created_at, modified_at, extra_details, cached_at, is_directory, tags)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                params![
+                    info.file_hash,
+                    info.path.to_string_lossy().to_string(),
+                    info.name,
+                    info.extension,
+                    info.size_bytes as i64,
+                    info.file_type,
+                    info.created_at,
+                    info.modified_at,
+                    extra_json,
+                    info.cached_at,
+                    info.is_directory,
+                    tags_json
+                ],
+            );
+        }
+    }
+
+    fn get_from_db(&self, hash: &str) -> Option<FileMetadataInfo> {
+        let conn = Connection::open(&self.db_path).ok()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT path, name, extension, size_bytes, file_type, created_at, modified_at, extra_details, cached_at, is_directory, tags FROM files WHERE file_hash = ?",
+            )
+            .ok()?;
+
+        let mut rows = stmt
+            .query_map(params![hash], |row| {
+                let path_str: String = row.get(0)?;
+                let name: String = row.get(1)?;
+                let extension: String = row.get(2)?;
+                let size_bytes: i64 = row.get(3)?;
+                let file_type: String = row.get(4)?;
+                let created_at: String = row.get(5)?;
+                let modified_at: String = row.get(6)?;
+                let extra_json: String = row.get(7)?;
+                let cached_at: String = row.get(8)?;
+                let is_directory: bool = row.get(9)?;
+                let tags_json: String = row.get(10)?;
+
+                Ok(FileMetadataInfo {
+                    path: PathBuf::from(path_str),
+                    name,
+                    extension,
+                    size_bytes: size_bytes as u64,
+                    file_type,
+                    created_at,
+                    modified_at,
+                    extra_details: serde_json::from_str(&extra_json).unwrap_or_default(),
+                    file_hash: hash.to_string(),
+                    cached_at,
+                    is_directory,
+                    tags: serde_json::from_str(&tags_json).unwrap_or_default(),
+                })
+            })
+            .ok()?;
+
+        rows.next().and_then(|r| r.ok())
+    }
+
+    fn fetch_all_from_db(&self) -> Vec<FileMetadataInfo> {
+        let mut list = Vec::new();
+        if let Ok(conn) = Connection::open(&self.db_path) {
+            if let Ok(mut stmt) = conn.prepare(
+                "SELECT file_hash, path, name, extension, size_bytes, file_type, created_at, modified_at, extra_details, cached_at, is_directory, tags FROM files"
+            ) {
+                if let Ok(rows) = stmt.query_map([], |row| {
+                    let file_hash: String = row.get(0)?;
+                    let path_str: String = row.get(1)?;
+                    let name: String = row.get(2)?;
+                    let extension: String = row.get(3)?;
+                    let size_bytes: i64 = row.get(4)?;
+                    let file_type: String = row.get(5)?;
+                    let created_at: String = row.get(6)?;
+                    let modified_at: String = row.get(7)?;
+                    let extra_json: String = row.get(8)?;
+                    let cached_at: String = row.get(9)?;
+                    let is_directory: bool = row.get(10)?;
+                    let tags_json: String = row.get(11)?;
+
+                    Ok(FileMetadataInfo {
+                        path: PathBuf::from(path_str),
+                        name,
+                        extension,
+                        size_bytes: size_bytes as u64,
+                        file_type,
+                        created_at,
+                        modified_at,
+                        extra_details: serde_json::from_str(&extra_json).unwrap_or_default(),
+                        file_hash,
+                        cached_at,
+                        is_directory,
+                        tags: serde_json::from_str(&tags_json).unwrap_or_default(),
+                    })
+                }) {
+                    for r in rows.flatten() {
+                        list.push(r);
+                    }
+                }
+            }
+        }
+        list
+    }
+
+    fn export_to_json(&mut self, items: &[FileMetadataInfo], label: &str) {
+        if let Some(path) = rfd::FileDialog::new()
+            .set_file_name(&format!("exported_{}.json", label))
+            .save_file()
+        {
+            if let Ok(json_data) = serde_json::to_string_pretty(items) {
+                if fs::write(&path, json_data).is_ok() {
+                    self.status_message = format!(
+                        "Successfully exported {} items to {}",
+                        items.len(),
+                        path.display()
+                    );
+                } else {
+                    self.status_message = "Failed to write export file.".to_string();
+                }
+            } else {
+                self.status_message = "Failed to serialize items to JSON.".to_string();
+            }
         }
     }
 
@@ -223,7 +378,7 @@ impl FileInspectorApp {
 
         if !metadata.is_dir() && self.config.excluded_files.contains(&file_name) {
             self.status_message = format!(
-                "Skipped: '{}' is explicitly excluded in config.json.",
+                "Skipped: '{}' is explicitly excluded in configuration.",
                 file_name
             );
             return;
@@ -241,18 +396,7 @@ impl FileInspectorApp {
                 .unwrap_or_else(|_| "Unavailable".to_string());
 
             let (total_files, indexed_files, unindexed_types, unknown_types) =
-                index_directory_recursive(
-                    &path,
-                    &self.config,
-                    &mut self.cached_index,
-                    &self.json_db_path,
-                );
-
-            self.file_hash_map = self
-                .cached_index
-                .iter()
-                .map(|(k, v)| (k.clone(), v.path.to_string_lossy().into_owned()))
-                .collect();
+                index_directory_recursive(&path, &self.config, &self.db_path);
 
             let mut extra_details = Vec::new();
             extra_details.push(("Total Files Encountered".into(), total_files.to_string()));
@@ -292,7 +436,7 @@ impl FileInspectorApp {
                 created_at,
                 modified_at,
                 extra_details,
-                file_hash: "N/A (Directory)".into(),
+                file_hash: format!("dir_{}", path.to_string_lossy()),
                 cached_at: format_system_time(SystemTime::now()),
                 is_directory: true,
                 tags: vec!["Directory".into()],
@@ -301,7 +445,7 @@ impl FileInspectorApp {
             self.tag_input_buffer = dir_info.tags.join(", ");
             self.current_file = Some(dir_info);
             self.status_message =
-                "Directory recursively indexed using config rules successfully.".to_string();
+                "Directory recursively indexed into SQLite successfully.".to_string();
             return;
         }
 
@@ -313,11 +457,10 @@ impl FileInspectorApp {
             }
         };
 
-        if let Some(cached_info) = self.cached_index.get(&file_hash).cloned() {
+        if let Some(cached_info) = self.get_from_db(&file_hash) {
             self.tag_input_buffer = cached_info.tags.join(", ");
             self.current_file = Some(cached_info);
-            self.status_message =
-                "Loaded file details instantly from local JSON cache (Hash match).".to_string();
+            self.status_message = "Loaded file details instantly from SQLite database.".to_string();
             return;
         }
 
@@ -335,8 +478,8 @@ impl FileInspectorApp {
         };
 
         let mut initial_tags = vec![file_type.clone()];
-        if let Ok(created_time) = metadata.created() {
-            let datetime: chrono::DateTime<chrono::Local> = created_time.into();
+        if let Ok(modified_time) = metadata.modified() {
+            let datetime: chrono::DateTime<chrono::Local> = modified_time.into();
             initial_tags.push(datetime.format("%Y").to_string());
             initial_tags.push(datetime.format("%B").to_string());
         }
@@ -399,8 +542,6 @@ impl FileInspectorApp {
             }
         }
 
-        let cached_at = format_system_time(SystemTime::now());
-
         let file_info = FileMetadataInfo {
             path: path.clone(),
             name,
@@ -411,18 +552,15 @@ impl FileInspectorApp {
             modified_at,
             extra_details,
             file_hash: file_hash.clone(),
-            cached_at,
+            cached_at: format_system_time(SystemTime::now()),
             is_directory: false,
             tags: initial_tags,
         };
 
         self.tag_input_buffer = file_info.tags.join(", ");
-        self.file_hash_map
-            .insert(file_hash.clone(), path.to_string_lossy().into_owned());
-        self.save_metadata_to_cache(&file_hash, &file_info);
-
+        self.save_to_db(&file_info);
         self.current_file = Some(file_info);
-        self.status_message = "File indexed with automatic tags successfully.".to_string();
+        self.status_message = "File indexed and stored in SQLite successfully.".to_string();
     }
 
     fn save_current_tags(&mut self) {
@@ -441,19 +579,11 @@ impl FileInspectorApp {
                     "Tags updated in current view (Directories are not cached by hash)."
                         .to_string();
             } else {
-                let hash = file_info.file_hash.clone();
                 let info_clone = file_info.clone();
-                self.save_metadata_to_cache(&hash, &info_clone);
+                self.save_to_db(&info_clone);
                 self.status_message =
-                    "Tags successfully updated and saved to file_index.json!".to_string();
+                    "Tags updated and saved to SQLite database successfully!".to_string();
             }
-        }
-    }
-
-    fn save_metadata_to_cache(&mut self, hash: &str, info: &FileMetadataInfo) {
-        self.cached_index.insert(hash.to_string(), info.clone());
-        if let Ok(serialized) = serde_json::to_string_pretty(&self.cached_index) {
-            let _ = fs::write(&self.json_db_path, serialized);
         }
     }
 }
@@ -461,13 +591,14 @@ impl FileInspectorApp {
 fn index_directory_recursive(
     dir_path: &Path,
     config: &AppConfig,
-    cached_index: &mut HashMap<String, FileMetadataInfo>,
-    json_db_path: &Path,
+    db_path: &Path,
 ) -> (usize, usize, HashMap<String, usize>, HashMap<String, usize>) {
     let mut total_files = 0;
     let mut indexed_files = 0;
     let mut unindexed_types: HashMap<String, usize> = HashMap::new();
     let mut unknown_types: HashMap<String, usize> = HashMap::new();
+
+    let conn = Connection::open(db_path).ok();
 
     if let Ok(entries) = fs::read_dir(dir_path) {
         for entry in entries.flatten() {
@@ -479,7 +610,7 @@ fn index_directory_recursive(
                     continue;
                 }
                 let (sub_total, sub_indexed, sub_unindexed, sub_unknown) =
-                    index_directory_recursive(&entry_path, config, cached_index, json_db_path);
+                    index_directory_recursive(&entry_path, config, db_path);
                 total_files += sub_total;
                 indexed_files += sub_indexed;
                 for (k, v) in sub_unindexed {
@@ -508,7 +639,15 @@ fn index_directory_recursive(
 
                 if let Ok(metadata) = fs::metadata(&entry_path) {
                     if let Ok(file_hash) = sha256::try_digest(entry_path.as_path()) {
-                        if !cached_index.contains_key(&file_hash) {
+                        let mut already_exists = false;
+                        if let Some(ref c) = conn {
+                            let mut stmt = c
+                                .prepare("SELECT 1 FROM files WHERE file_hash = ?")
+                                .unwrap();
+                            already_exists = stmt.exists(params![file_hash]).unwrap_or(false);
+                        }
+
+                        if !already_exists {
                             let size_bytes = metadata.len();
                             let file_type = if extension.is_empty() {
                                 "Unknown / Binary".to_string()
@@ -517,8 +656,9 @@ fn index_directory_recursive(
                             };
 
                             let mut initial_tags = vec![file_type.clone()];
-                            if let Ok(created_time) = metadata.created() {
-                                let datetime: chrono::DateTime<chrono::Local> = created_time.into();
+                            if let Ok(modified_time) = metadata.modified() {
+                                let datetime: chrono::DateTime<chrono::Local> =
+                                    modified_time.into();
                                 initial_tags.push(datetime.format("%Y").to_string());
                                 initial_tags.push(datetime.format("%B").to_string());
                             }
@@ -555,7 +695,30 @@ fn index_directory_recursive(
                                 tags: initial_tags,
                             };
 
-                            cached_index.insert(file_hash, file_info);
+                            if let Some(ref c) = conn {
+                                let extra_json = serde_json::to_string(&file_info.extra_details)
+                                    .unwrap_or_default();
+                                let tags_json =
+                                    serde_json::to_string(&file_info.tags).unwrap_or_default();
+                                let _ = c.execute(
+                                    "INSERT OR REPLACE INTO files (file_hash, path, name, extension, size_bytes, file_type, created_at, modified_at, extra_details, cached_at, is_directory, tags)
+                                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                                    params![
+                                        file_info.file_hash,
+                                        file_info.path.to_string_lossy().to_string(),
+                                        file_info.name,
+                                        file_info.extension,
+                                        file_info.size_bytes as i64,
+                                        file_info.file_type,
+                                        file_info.created_at,
+                                        file_info.modified_at,
+                                        extra_json,
+                                        file_info.cached_at,
+                                        file_info.is_directory,
+                                        tags_json
+                                    ],
+                                );
+                            }
                         }
                         indexed_files += 1;
                     } else {
@@ -568,24 +731,7 @@ fn index_directory_recursive(
         }
     }
 
-    if let Ok(serialized) = serde_json::to_string_pretty(cached_index) {
-        let _ = fs::write(json_db_path, serialized);
-    }
-
     (total_files, indexed_files, unindexed_types, unknown_types)
-}
-
-fn load_full_cache_from_json(path: &Path) -> HashMap<String, FileMetadataInfo> {
-    if path.exists() {
-        if let Ok(content) = fs::read_to_string(path) {
-            if let Ok(full_cache) =
-                serde_json::from_str::<HashMap<String, FileMetadataInfo>>(&content)
-            {
-                return full_cache;
-            }
-        }
-    }
-    HashMap::new()
 }
 
 #[derive(Deserialize)]
@@ -732,8 +878,8 @@ impl eframe::App for FileInspectorApp {
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("File Inspector");
-            ui.add_space(8.0);
+            ui.heading("File Inspector (SQLite & Multi-Search)");
+            ui.add_space(6.0);
 
             ui.horizontal(|ui| {
                 if ui.button("📁 Browse...").clicked() {
@@ -744,58 +890,82 @@ impl eframe::App for FileInspectorApp {
                 if ui.button("🔄 Reload Config").clicked() {
                     self.reload_config();
                 }
+
+                if ui.button("📤 Export Whole DB").clicked() {
+                    let all_items = self.fetch_all_from_db();
+                    self.export_to_json(&all_items, "whole_database");
+                }
                 ui.label(&self.status_message);
             });
 
             ui.add_space(6.0);
 
             ui.horizontal(|ui| {
-                ui.label("🔍 Search Index (Filename / Tags):");
-                ui.add(egui::TextEdit::singleline(&mut self.search_query).desired_width(300.0));
+                ui.label("🔍 Search (comma-separated, e.g. jpg, 2025):");
+                ui.add(egui::TextEdit::singleline(&mut self.search_query).desired_width(280.0));
                 if !self.search_query.is_empty() && ui.button("Clear").clicked() {
                     self.search_query.clear();
                 }
             });
 
             egui::ScrollArea::vertical().max_height(HEIGHT - 50.0).show(ui, |ui| {
-            if !self.search_query.is_empty() {
-                let query = self.search_query.to_lowercase();
-                let matches: Vec<FileMetadataInfo> = self.cached_index
-                    .values()
-                    .filter(|info| {
-                        let name_match = info.name.to_lowercase().contains(&query);
-                        let tag_match = info.tags.iter().any(|t| t.to_lowercase().contains(&query));
-                        name_match || tag_match
-                    })
-                    .cloned()
-                    .collect();
+                let all_files = self.fetch_all_from_db();
 
-                ui.add_space(4.0);
-                ui.group(|ui| {
-                    ui.set_width(ui.available_width());
-                    ui.strong(format!("Search Results ({} found)", matches.len()));
+                if !self.search_query.is_empty() {
+                    let terms: Vec<String> = self.search_query
+                        .split(',')
+                        .map(|s| s.trim().to_lowercase())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+
+                    let matches: Vec<FileMetadataInfo> = all_files
+                        .iter()
+                        .filter(|info| {
+                            if terms.is_empty() {
+                                return false;
+                            }
+                            // Match if ALL terms or ANY term match? Usually multi-search implies checking if queries match text/tags. Let's do ANY term matches filename or tags for flexible search, or match all terms. Let's make it match if *any* term is found in name or tags, or refine as needed. Let's match if all terms are satisfied or any term. Let's do: matches if query terms match name or tags.
+                            terms.iter().any(|term| {
+                                let name_match = info.name.to_lowercase().contains(term);
+                                let tag_match = info.tags.iter().any(|t| t.to_lowercase().contains(term));
+                                let ext_match = info.extension.to_lowercase() == *term;
+                                name_match || tag_match || ext_match
+                            })
+                        })
+                        .cloned()
+                        .collect();
+
                     ui.add_space(4.0);
-
-                    if matches.is_empty() {
-                        ui.label(egui::RichText::new("No matching indexed files found.").italics().color(egui::Color32::GRAY));
-                    } else {
-                        egui::ScrollArea::vertical().max_height(150.0).show(ui, |ui| {
-                            for file_info in matches {
-                                ui.horizontal(|ui| {
-                                    if ui.button("📂 Select").clicked() {
-                                        let path = file_info.path.clone();
-                                        self.inspect_path(path);
-                                    }
-                                    ui.label(format!("{} [{}]", file_info.name, file_info.tags.join(", ")));
-                                });
+                    ui.group(|ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            ui.strong(format!("Search Results ({} found)", matches.len()));
+                            if ui.button("📤 Export Search Results").clicked() {
+                                self.export_to_json(&matches, "search_results");
                             }
                         });
-                    }
-                });
-            }
+                        ui.add_space(4.0);
 
-            ui.separator();
-            ui.add_space(4.0);
+                        if matches.is_empty() {
+                            ui.label(egui::RichText::new("No matching indexed files found.").italics().color(egui::Color32::GRAY));
+                        } else {
+                            egui::ScrollArea::vertical().max_height(140.0).show(ui, |ui| {
+                                for file_info in matches {
+                                    ui.horizontal(|ui| {
+                                        if ui.button("📂 Select").clicked() {
+                                            let path = file_info.path.clone();
+                                            self.inspect_path(path);
+                                        }
+                                        ui.label(format!("{} [{}]", file_info.name, file_info.tags.join(", ")));
+                                    });
+                                }
+                            });
+                        }
+                    });
+                }
+
+                ui.separator();
+                ui.add_space(4.0);
 
                 if let Some(file_info) = &self.current_file {
                     let is_directory = file_info.is_directory;
@@ -862,9 +1032,26 @@ impl eframe::App for FileInspectorApp {
 
                         ui.horizontal(|ui| {
                             ui.label("Tags (comma separated):");
-                            ui.add(egui::TextEdit::singleline(&mut self.tag_input_buffer).desired_width(350.0));
+                            ui.add(egui::TextEdit::singleline(&mut self.tag_input_buffer).desired_width(300.0));
                             if ui.button("💾 Save Tags").clicked() {
                                 self.save_current_tags();
+                            }
+                            if ui.button("📤 Export Tag Results").clicked() {
+                                let current_tags: Vec<String> = self.tag_input_buffer
+                                    .split(',')
+                                    .map(|s| s.trim().to_lowercase())
+                                    .filter(|s| !s.is_empty())
+                                    .collect();
+
+                                let filtered_by_tags: Vec<FileMetadataInfo> = all_files
+                                    .iter()
+                                    .filter(|f| {
+                                        current_tags.iter().any(|ct| f.tags.iter().any(|ft| ft.to_lowercase().contains(ct)))
+                                    })
+                                    .cloned()
+                                    .collect();
+
+                                self.export_to_json(&filtered_by_tags, "filtered_by_tags");
                             }
                         });
 
