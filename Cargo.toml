@@ -1,0 +1,13 @@
+[package]
+name = "file-inspector"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+eframe = "0.31" # Or your preferred recent egui/eframe version
+rfd = "0.15"   # Modern portable native file dialogs for Windows 11
+image = "0.25" # Image decoding & resolution inspection
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+chrono = "0.4" # Human-readable file timestamps
+sha256 = "1.5"
