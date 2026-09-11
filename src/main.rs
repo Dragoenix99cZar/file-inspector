@@ -108,10 +108,13 @@ impl Default for AppConfig {
     }
 }
 
+const WIDTH: f32 = 900.0;
+const HEIGHT: f32 = 750.0;
+
 fn main() -> Result<(), eframe::Error> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([900.0, 750.0])
+            .with_inner_size([WIDTH, HEIGHT])
             .with_drag_and_drop(true),
         ..Default::default()
     };
@@ -237,20 +240,54 @@ impl FileInspectorApp {
                 .map(format_system_time)
                 .unwrap_or_else(|_| "Unavailable".to_string());
 
-            let (total_size, file_count) = count_dir_contents(
-                &path,
-                &self.config.ignored_folders,
-                &self.config.excluded_files,
-            );
+            let (total_files, indexed_files, unindexed_types, unknown_types) =
+                index_directory_recursive(
+                    &path,
+                    &self.config,
+                    &mut self.cached_index,
+                    &self.json_db_path,
+                );
+
+            self.file_hash_map = self
+                .cached_index
+                .iter()
+                .map(|(k, v)| (k.clone(), v.path.to_string_lossy().into_owned()))
+                .collect();
 
             let mut extra_details = Vec::new();
-            extra_details.push(("Total Files & Folders".into(), file_count.to_string()));
+            extra_details.push(("Total Files Encountered".into(), total_files.to_string()));
+            extra_details.push((
+                "Successfully Indexed Files".into(),
+                indexed_files.to_string(),
+            ));
+
+            let unindexed_summary = if unindexed_types.is_empty() {
+                "None".into()
+            } else {
+                unindexed_types
+                    .iter()
+                    .map(|(k, v)| format!("{}: {}", k, v))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            extra_details.push(("Un-indexed Files / Types".into(), unindexed_summary));
+
+            let unknown_summary = if unknown_types.is_empty() {
+                "None".into()
+            } else {
+                unknown_types
+                    .iter()
+                    .map(|(k, v)| format!("{}: {}", k, v))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            extra_details.push(("Unknown File Types".into(), unknown_summary));
 
             let dir_info = FileMetadataInfo {
                 path: path.clone(),
                 name,
                 extension: "".into(),
-                size_bytes: total_size,
+                size_bytes: 0,
                 file_type: "Directory".into(),
                 created_at,
                 modified_at,
@@ -264,7 +301,7 @@ impl FileInspectorApp {
             self.tag_input_buffer = dir_info.tags.join(", ");
             self.current_file = Some(dir_info);
             self.status_message =
-                "Directory inspected successfully (config rules applied).".to_string();
+                "Directory recursively indexed using config rules successfully.".to_string();
             return;
         }
 
@@ -297,7 +334,6 @@ impl FileInspectorApp {
             format!("{} file", extension.to_uppercase())
         };
 
-        // Extract creation year and month, and construct automatic initial tags
         let mut initial_tags = vec![file_type.clone()];
         if let Ok(created_time) = metadata.created() {
             let datetime: chrono::DateTime<chrono::Local> = created_time.into();
@@ -386,8 +422,7 @@ impl FileInspectorApp {
         self.save_metadata_to_cache(&file_hash, &file_info);
 
         self.current_file = Some(file_info);
-        self.status_message =
-            "File indexed with automatic tags (filetype, year, month) successfully.".to_string();
+        self.status_message = "File indexed with automatic tags successfully.".to_string();
     }
 
     fn save_current_tags(&mut self) {
@@ -395,7 +430,7 @@ impl FileInspectorApp {
             let parsed_tags: Vec<String> = self
                 .tag_input_buffer
                 .split(',')
-                .map(|s| s.trim().to_string().to_ascii_lowercase())
+                .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect();
 
@@ -423,6 +458,123 @@ impl FileInspectorApp {
     }
 }
 
+fn index_directory_recursive(
+    dir_path: &Path,
+    config: &AppConfig,
+    cached_index: &mut HashMap<String, FileMetadataInfo>,
+    json_db_path: &Path,
+) -> (usize, usize, HashMap<String, usize>, HashMap<String, usize>) {
+    let mut total_files = 0;
+    let mut indexed_files = 0;
+    let mut unindexed_types: HashMap<String, usize> = HashMap::new();
+    let mut unknown_types: HashMap<String, usize> = HashMap::new();
+
+    if let Ok(entries) = fs::read_dir(dir_path) {
+        for entry in entries.flatten() {
+            let entry_path = entry.path();
+            let file_name = entry.file_name().to_string_lossy().into_owned();
+
+            if entry_path.is_dir() {
+                if config.ignored_folders.iter().any(|ig| ig == &file_name) {
+                    continue;
+                }
+                let (sub_total, sub_indexed, sub_unindexed, sub_unknown) =
+                    index_directory_recursive(&entry_path, config, cached_index, json_db_path);
+                total_files += sub_total;
+                indexed_files += sub_indexed;
+                for (k, v) in sub_unindexed {
+                    *unindexed_types.entry(k).or_insert(0) += v;
+                }
+                for (k, v) in sub_unknown {
+                    *unknown_types.entry(k).or_insert(0) += v;
+                }
+            } else if entry_path.is_file() {
+                total_files += 1;
+
+                if config.excluded_files.contains(&file_name) {
+                    *unindexed_types.entry("Excluded File".into()).or_insert(0) += 1;
+                    continue;
+                }
+
+                let extension = entry_path
+                    .extension()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_lowercase();
+
+                if extension.is_empty() {
+                    *unknown_types.entry("No Extension".into()).or_insert(0) += 1;
+                }
+
+                if let Ok(metadata) = fs::metadata(&entry_path) {
+                    if let Ok(file_hash) = sha256::try_digest(entry_path.as_path()) {
+                        if !cached_index.contains_key(&file_hash) {
+                            let size_bytes = metadata.len();
+                            let file_type = if extension.is_empty() {
+                                "Unknown / Binary".to_string()
+                            } else {
+                                format!("{} file", extension.to_uppercase())
+                            };
+
+                            let mut initial_tags = vec![file_type.clone()];
+                            if let Ok(created_time) = metadata.created() {
+                                let datetime: chrono::DateTime<chrono::Local> = created_time.into();
+                                initial_tags.push(datetime.format("%Y").to_string());
+                                initial_tags.push(datetime.format("%B").to_string());
+                            }
+
+                            let created_at = metadata
+                                .created()
+                                .map(format_system_time)
+                                .unwrap_or_else(|_| "Unavailable".to_string());
+                            let modified_at = metadata
+                                .modified()
+                                .map(format_system_time)
+                                .unwrap_or_else(|_| "Unavailable".to_string());
+
+                            let mut extra_details = Vec::new();
+                            if config.included_files.contains(&file_name) {
+                                extra_details.push((
+                                    "Config Status".into(),
+                                    "Explicitly Included Priority File".into(),
+                                ));
+                            }
+
+                            let file_info = FileMetadataInfo {
+                                path: entry_path.clone(),
+                                name: file_name,
+                                extension,
+                                size_bytes,
+                                file_type,
+                                created_at,
+                                modified_at,
+                                extra_details,
+                                file_hash: file_hash.clone(),
+                                cached_at: format_system_time(SystemTime::now()),
+                                is_directory: false,
+                                tags: initial_tags,
+                            };
+
+                            cached_index.insert(file_hash, file_info);
+                        }
+                        indexed_files += 1;
+                    } else {
+                        *unindexed_types.entry("Hash Error".into()).or_insert(0) += 1;
+                    }
+                } else {
+                    *unindexed_types.entry("Metadata Error".into()).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+
+    if let Ok(serialized) = serde_json::to_string_pretty(cached_index) {
+        let _ = fs::write(json_db_path, serialized);
+    }
+
+    (total_files, indexed_files, unindexed_types, unknown_types)
+}
+
 fn load_full_cache_from_json(path: &Path) -> HashMap<String, FileMetadataInfo> {
     if path.exists() {
         if let Ok(content) = fs::read_to_string(path) {
@@ -434,40 +586,6 @@ fn load_full_cache_from_json(path: &Path) -> HashMap<String, FileMetadataInfo> {
         }
     }
     HashMap::new()
-}
-
-fn count_dir_contents(
-    path: &Path,
-    ignored_folders: &[String],
-    excluded_files: &[String],
-) -> (u64, usize) {
-    let mut total_size = 0;
-    let mut file_count = 0;
-    if let Ok(entries) = fs::read_dir(path) {
-        for entry in entries.flatten() {
-            let entry_path = entry.path();
-            let file_name = entry.file_name().to_string_lossy().into_owned();
-
-            if ignored_folders.iter().any(|ig| ig == &file_name)
-                || excluded_files.iter().any(|ex| ex == &file_name)
-            {
-                continue;
-            }
-
-            file_count += 1;
-            if let Ok(meta) = entry.metadata() {
-                if meta.is_dir() {
-                    let (sub_size, sub_count) =
-                        count_dir_contents(&entry_path, ignored_folders, excluded_files);
-                    total_size += sub_size;
-                    file_count += sub_count;
-                } else {
-                    total_size += meta.len();
-                }
-            }
-        }
-    }
-    (total_size, file_count)
 }
 
 #[derive(Deserialize)]
@@ -614,7 +732,7 @@ impl eframe::App for FileInspectorApp {
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("File Inspector - Rust");
+            ui.heading("File Inspector");
             ui.add_space(8.0);
 
             ui.horizontal(|ui| {
@@ -639,6 +757,7 @@ impl eframe::App for FileInspectorApp {
                 }
             });
 
+            egui::ScrollArea::vertical().max_height(HEIGHT - 50.0).show(ui, |ui| {
             if !self.search_query.is_empty() {
                 let query = self.search_query.to_lowercase();
                 let matches: Vec<FileMetadataInfo> = self.cached_index
@@ -678,117 +797,120 @@ impl eframe::App for FileInspectorApp {
             ui.separator();
             ui.add_space(4.0);
 
-            if let Some(file_info) = &self.current_file {
-                let is_directory = file_info.is_directory;
-                let name = file_info.name.clone();
-                let path_str = file_info.path.to_string_lossy().to_string();
-                let file_hash = file_info.file_hash.clone();
-                let file_type = file_info.file_type.clone();
-                let size_bytes = file_info.size_bytes;
-                let created_at = file_info.created_at.clone();
-                let modified_at = file_info.modified_at.clone();
-                let tags = file_info.tags.clone();
-                let extra_details = file_info.extra_details.clone();
+                if let Some(file_info) = &self.current_file {
+                    let is_directory = file_info.is_directory;
+                    let name = file_info.name.clone();
+                    let path_str = file_info.path.to_string_lossy().to_string();
+                    let file_hash = file_info.file_hash.clone();
+                    let file_type = file_info.file_type.clone();
+                    let size_bytes = file_info.size_bytes;
+                    let created_at = file_info.created_at.clone();
+                    let modified_at = file_info.modified_at.clone();
+                    let tags = file_info.tags.clone();
+                    let extra_details = file_info.extra_details.clone();
 
-                ui.group(|ui| {
-                    ui.set_width(ui.available_width());
-                    ui.strong(if is_directory { "Directory Attributes" } else { "General Attributes" });
-                    ui.add_space(4.0);
-
-                    egui::Grid::new("file_meta_grid")
-                        .num_columns(2)
-                        .spacing([40.0, 6.0])
-                        .striped(true)
-                        .show(ui, |ui| {
-                            ui.label("Name");
-                            ui.add(egui::Label::new(&name).wrap());
-                            ui.end_row();
-
-                            ui.label("Full Path");
-                            ui.add(egui::Label::new(path_str).wrap().sense(egui::Sense::hover()));
-                            ui.end_row();
-
-                            if !is_directory {
-                                ui.label("SHA-256 Hash");
-                                ui.add(egui::Label::new(&file_hash).wrap());
-                                ui.end_row();
-                            }
-
-                            ui.label("Type");
-                            ui.label(&file_type);
-                            ui.end_row();
-
-                            ui.label("Size");
-                            ui.label(format!("{} ({} bytes)", format_file_size(size_bytes), size_bytes));
-                            ui.end_row();
-
-                            ui.label("Created At");
-                            ui.label(&created_at);
-                            ui.end_row();
-
-                            ui.label("Last Modified");
-                            ui.label(&modified_at);
-                            ui.end_row();
-                        });
-                });
-
-                ui.add_space(10.0);
-
-                ui.group(|ui| {
-                    ui.set_width(ui.available_width());
-                    ui.strong("Custom Tags Management");
-                    ui.add_space(4.0);
-
-                    ui.horizontal(|ui| {
-                        ui.label("Tags (comma separated):");
-                        ui.add(egui::TextEdit::singleline(&mut self.tag_input_buffer).desired_width(350.0));
-                        if ui.button("💾 Save Tags").clicked() {
-                            self.save_current_tags();
-                        }
-                    });
-
-                    if !tags.is_empty() {
-                        ui.add_space(4.0);
-                        ui.horizontal(|ui| {
-                            ui.label("Current Tags:");
-                            for tag in &tags {
-                                ui.add(egui::Label::new(format!("[{}]", tag)));
-                            }
-                        });
-                    }
-                });
-
-                ui.add_space(10.0);
-
-                if !extra_details.is_empty() {
                     ui.group(|ui| {
                         ui.set_width(ui.available_width());
-                        ui.strong("Parsed Format Metadata");
+                        ui.strong(if is_directory { "Directory Attributes" } else { "General Attributes" });
                         ui.add_space(4.0);
 
-                        egui::Grid::new("extra_meta_grid")
+                        egui::Grid::new("file_meta_grid")
                             .num_columns(2)
                             .spacing([40.0, 6.0])
                             .striped(true)
                             .show(ui, |ui| {
-                                for (key, val) in &extra_details {
-                                    ui.label(key);
-                                    ui.add(egui::Label::new(val).wrap());
+                                ui.label("Name");
+                                ui.add(egui::Label::new(&name).wrap());
+                                ui.end_row();
+
+                                ui.label("Full Path");
+                                ui.add(egui::Label::new(path_str).wrap().sense(egui::Sense::hover()));
+                                ui.end_row();
+
+                                if !is_directory {
+                                    ui.label("SHA-256 Hash");
+                                    ui.add(egui::Label::new(&file_hash).wrap());
                                     ui.end_row();
                                 }
+
+                                ui.label("Type");
+                                ui.label(&file_type);
+                                ui.end_row();
+
+                                if !is_directory {
+                                    ui.label("Size");
+                                    ui.label(format!("{} ({} bytes)", format_file_size(size_bytes), size_bytes));
+                                    ui.end_row();
+                                }
+
+                                ui.label("Created At");
+                                ui.label(&created_at);
+                                ui.end_row();
+
+                                ui.label("Last Modified");
+                                ui.label(&modified_at);
+                                ui.end_row();
                             });
                     });
+
+                    ui.add_space(10.0);
+
+                    ui.group(|ui| {
+                        ui.set_width(ui.available_width());
+                        ui.strong("Custom Tags Management");
+                        ui.add_space(4.0);
+
+                        ui.horizontal(|ui| {
+                            ui.label("Tags (comma separated):");
+                            ui.add(egui::TextEdit::singleline(&mut self.tag_input_buffer).desired_width(350.0));
+                            if ui.button("💾 Save Tags").clicked() {
+                                self.save_current_tags();
+                            }
+                        });
+
+                        if !tags.is_empty() {
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                ui.label("Current Tags:");
+                                for tag in &tags {
+                                    ui.add(egui::Label::new(format!("[{}]", tag)));
+                                }
+                            });
+                        }
+                    });
+
+                    ui.add_space(10.0);
+
+                    if !extra_details.is_empty() {
+                        ui.group(|ui| {
+                            ui.set_width(ui.available_width());
+                            ui.strong("Parsed Format Metadata");
+                            ui.add_space(4.0);
+
+                            egui::Grid::new("extra_meta_grid")
+                                .num_columns(2)
+                                .spacing([40.0, 6.0])
+                                .striped(true)
+                                .show(ui, |ui| {
+                                    for (key, val) in &extra_details {
+                                        ui.label(key);
+                                        ui.add(egui::Label::new(val).wrap());
+                                        ui.end_row();
+                                    }
+                                });
+                        });
+                    }
+                } else {
+                    ui.add_space(40.0);
+                    ui.centered_and_justified(|ui| {
+                        ui.label(
+                            egui::RichText::new("Drag & Drop a file or folder anywhere onto this window\nor click 'Browse...' to inspect.")
+                                .color(egui::Color32::GRAY)
+                                .italics(),
+                        );
+                    });
                 }
-            } else {
-                ui.add_space(40.0);
-                ui.centered_and_justified(|ui| {
-                    ui.label(
-                        egui::RichText::new("Drag & Drop a file or folder anywhere onto this window\nor click 'Browse...' to inspect.")
-                            .color(egui::Color32::GRAY)
-                            .italics(),
-                    );
-                });
-            }
+            });
         });
     }
 }
