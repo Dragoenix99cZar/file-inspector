@@ -25,31 +25,25 @@ struct AppConfig {
 
 impl Default for AppConfig {
     fn default() -> Self {
-        let mut language_extensions = HashMap::new();
-        let extensions = [
-            ("rs", "Rust"),
-            ("py", "Python"),
-            ("js", "JavaScript"),
-            ("ts", "TypeScript"),
-            ("md", "Markdown"),
-            ("toml", "TOML Config"),
-            ("json", "JSON Data"),
-            ("yaml", "YAML Config"),
-            ("yml", "YAML Config"),
-            ("xml", "XML Document"),
-            ("html", "HTML Markup"),
-            ("css", "Cascading Style Sheets"),
-            ("c", "C Source"),
-            ("cpp", "C++ Source"),
-            ("h", "C/C++ Header"),
-        ];
-
-        for (ext, name) in extensions {
-            language_extensions.insert(ext.to_string(), name.to_string());
-        }
+        let mut lang_exts = HashMap::new();
+        lang_exts.insert("rs".to_string(), "Rust".to_string());
+        lang_exts.insert("py".to_string(), "Python".to_string());
+        lang_exts.insert("js".to_string(), "JavaScript".to_string());
+        lang_exts.insert("ts".to_string(), "TypeScript".to_string());
+        lang_exts.insert("md".to_string(), "Markdown".to_string());
+        lang_exts.insert("toml".to_string(), "TOML Config".to_string());
+        lang_exts.insert("json".to_string(), "JSON Data".to_string());
+        lang_exts.insert("yaml".to_string(), "YAML Config".to_string());
+        lang_exts.insert("yml".to_string(), "YAML Config".to_string());
+        lang_exts.insert("xml".to_string(), "XML Document".to_string());
+        lang_exts.insert("html".to_string(), "HTML Markup".to_string());
+        lang_exts.insert("css".to_string(), "Cascading Style Sheets".to_string());
+        lang_exts.insert("c".to_string(), "C Source".to_string());
+        lang_exts.insert("cpp".to_string(), "C++ Source".to_string());
+        lang_exts.insert("h".to_string(), "C/C++ Header".to_string());
 
         Self {
-            language_extensions,
+            language_extensions: lang_exts,
             search_criteria: SearchCriteria {
                 image_extensions: vec![
                     "png".into(),
@@ -111,7 +105,7 @@ impl Default for AppConfig {
 fn main() -> Result<(), eframe::Error> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([900.0, 750.0])
+            .with_inner_size([850.0, 720.0])
             .with_drag_and_drop(true),
         ..Default::default()
     };
@@ -145,10 +139,8 @@ struct FileInspectorApp {
     json_db_path: PathBuf,
     config_path: PathBuf,
     file_hash_map: HashMap<String, String>,
-    cached_index: HashMap<String, FileMetadataInfo>,
     config: AppConfig,
     tag_input_buffer: String,
-    search_query: String,
 }
 
 impl Default for FileInspectorApp {
@@ -158,18 +150,20 @@ impl Default for FileInspectorApp {
         let json_db_path = exe_dir.join("file_index.json");
         let config_path = exe_dir.join("config.json");
 
-        // Assume config.json is always available; read directly
-        let config_content = fs::read_to_string(&config_path).expect(
-            "Failed to read config.json. Ensure the file exists in the executable directory.",
-        );
-        let config: AppConfig = serde_json::from_str(&config_content)
-            .expect("Failed to parse config.json. Check syntax.");
+        let config = if config_path.exists() {
+            fs::read_to_string(&config_path)
+                .ok()
+                .and_then(|c| serde_json::from_str(&c).ok())
+                .unwrap_or_else(AppConfig::default)
+        } else {
+            let default_cfg = AppConfig::default();
+            if let Ok(serialized) = serde_json::to_string_pretty(&default_cfg) {
+                let _ = fs::write(&config_path, serialized);
+            }
+            default_cfg
+        };
 
-        let cached_index = load_full_cache_from_json(&json_db_path);
-        let file_hash_map = cached_index
-            .iter()
-            .map(|(k, v)| (k.clone(), v.path.to_string_lossy().into_owned()))
-            .collect();
+        let file_hash_map = load_hash_map_from_json(&json_db_path);
 
         Self {
             current_file: None,
@@ -177,24 +171,26 @@ impl Default for FileInspectorApp {
             json_db_path,
             config_path,
             file_hash_map,
-            cached_index,
             config,
             tag_input_buffer: String::new(),
-            search_query: String::new(),
         }
     }
 }
 
 impl FileInspectorApp {
     fn reload_config(&mut self) {
-        let content = fs::read_to_string(&self.config_path).unwrap_or_default();
-        if let Ok(parsed) = serde_json::from_str::<AppConfig>(&content) {
-            self.config = parsed;
-            self.status_message =
-                "Configuration reloaded successfully from config.json.".to_string();
-        } else {
-            self.status_message = "Failed to reload config.json (syntax error).".to_string();
+        if self.config_path.exists() {
+            if let Ok(content) = fs::read_to_string(&self.config_path) {
+                if let Ok(parsed) = serde_json::from_str::<AppConfig>(&content) {
+                    self.config = parsed;
+                    self.status_message =
+                        "Configuration reloaded successfully from config.json.".to_string();
+                    return;
+                }
+            }
         }
+        self.status_message =
+            "Failed to reload config.json (syntax error or missing file).".to_string();
     }
 
     fn inspect_path(&mut self, path: PathBuf) {
@@ -277,7 +273,7 @@ impl FileInspectorApp {
             }
         };
 
-        if let Some(cached_info) = self.cached_index.get(&file_hash).cloned() {
+        if let Some(cached_info) = self.load_cached_metadata(&file_hash) {
             self.tag_input_buffer = cached_info.tags.join(", ");
             self.current_file = Some(cached_info);
             self.status_message =
@@ -408,25 +404,35 @@ impl FileInspectorApp {
         }
     }
 
-    fn save_metadata_to_cache(&mut self, hash: &str, info: &FileMetadataInfo) {
-        self.cached_index.insert(hash.to_string(), info.clone());
-        if let Ok(serialized) = serde_json::to_string_pretty(&self.cached_index) {
+    fn load_cached_metadata(&self, hash: &str) -> Option<FileMetadataInfo> {
+        if self.file_hash_map.contains_key(hash) {
+            if let Ok(file_content) = fs::read_to_string(&self.json_db_path) {
+                if let Ok(full_cache) =
+                    serde_json::from_str::<HashMap<String, FileMetadataInfo>>(&file_content)
+                {
+                    return full_cache.get(hash).cloned();
+                }
+            }
+        }
+        None
+    }
+
+    fn save_metadata_to_cache(&self, hash: &str, info: &FileMetadataInfo) {
+        let mut full_cache: HashMap<String, FileMetadataInfo> = if self.json_db_path.exists() {
+            fs::read_to_string(&self.json_db_path)
+                .ok()
+                .and_then(|content| serde_json::from_str(&content).ok())
+                .unwrap_or_default()
+        } else {
+            HashMap::new()
+        };
+
+        full_cache.insert(hash.to_string(), info.clone());
+
+        if let Ok(serialized) = serde_json::to_string_pretty(&full_cache) {
             let _ = fs::write(&self.json_db_path, serialized);
         }
     }
-}
-
-fn load_full_cache_from_json(path: &Path) -> HashMap<String, FileMetadataInfo> {
-    if path.exists() {
-        if let Ok(content) = fs::read_to_string(path) {
-            if let Ok(full_cache) =
-                serde_json::from_str::<HashMap<String, FileMetadataInfo>>(&content)
-            {
-                return full_cache;
-            }
-        }
-    }
-    HashMap::new()
 }
 
 fn count_dir_contents(
@@ -461,6 +467,22 @@ fn count_dir_contents(
         }
     }
     (total_size, file_count)
+}
+
+fn load_hash_map_from_json(path: &Path) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    if path.exists() {
+        if let Ok(content) = fs::read_to_string(path) {
+            if let Ok(full_cache) =
+                serde_json::from_str::<HashMap<String, FileMetadataInfo>>(&content)
+            {
+                for (hash, info) in full_cache {
+                    map.insert(hash, info.path.to_string_lossy().into_owned());
+                }
+            }
+        }
+    }
+    map
 }
 
 #[derive(Deserialize)]
@@ -595,7 +617,6 @@ fn format_file_size(bytes: u64) -> String {
 
 impl eframe::App for FileInspectorApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        ctx.set_pixels_per_point(1.7);
         ctx.input(|i| {
             if !i.raw.dropped_files.is_empty() {
                 if let Some(file) = i.raw.dropped_files.first() {
@@ -622,57 +643,10 @@ impl eframe::App for FileInspectorApp {
                 ui.label(&self.status_message);
             });
 
-            ui.add_space(6.0);
-
-            // Search Bar for `file_index.json`
-            ui.horizontal(|ui| {
-                ui.label("🔍 Search Index (Filename / Tags):");
-                ui.add(egui::TextEdit::singleline(&mut self.search_query).desired_width(300.0));
-                if !self.search_query.is_empty() && ui.button("Clear").clicked() {
-                    self.search_query.clear();
-                }
-            });
-
-            // Display Search Results if query is active (using in-memory cached_index to prevent flicker)
-            if !self.search_query.is_empty() {
-                let query = self.search_query.to_lowercase();
-                let matches: Vec<FileMetadataInfo> = self.cached_index
-                    .values()
-                    .filter(|info| {
-                        let name_match = info.name.to_lowercase().contains(&query);
-                        let tag_match = info.tags.iter().any(|t| t.to_lowercase().contains(&query));
-                        name_match || tag_match
-                    })
-                    .cloned()
-                    .collect();
-
-                ui.add_space(4.0);
-                ui.group(|ui| {
-                    ui.set_width(ui.available_width());
-                    ui.strong(format!("Search Results ({} found)", matches.len()));
-                    ui.add_space(4.0);
-
-                    if matches.is_empty() {
-                        ui.label(egui::RichText::new("No matching indexed files found.").italics().color(egui::Color32::GRAY));
-                    } else {
-                        egui::ScrollArea::vertical().max_height(150.0).show(ui, |ui| {
-                            for file_info in matches {
-                                ui.horizontal(|ui| {
-                                    if ui.button("📂 Select").clicked() {
-                                        let path = file_info.path.clone();
-                                        self.inspect_path(path);
-                                    }
-                                    ui.label(format!("{} [{}]", file_info.name, file_info.tags.join(", ")));
-                                });
-                            }
-                        });
-                    }
-                });
-            }
-
             ui.separator();
             ui.add_space(4.0);
 
+            // Extract values upfront if current_file is present to avoid borrowing `self` immutably for too long
             if let Some(file_info) = &self.current_file {
                 let is_directory = file_info.is_directory;
                 let name = file_info.name.clone();
@@ -729,6 +703,7 @@ impl eframe::App for FileInspectorApp {
 
                 ui.add_space(10.0);
 
+                // Custom Tag Management Section (Now safely able to mutate `self` via `self.save_current_tags()`)
                 ui.group(|ui| {
                     ui.set_width(ui.available_width());
                     ui.strong("Custom Tags Management");
