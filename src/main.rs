@@ -158,7 +158,6 @@ impl Default for FileInspectorApp {
         let json_db_path = exe_dir.join("file_index.json");
         let config_path = exe_dir.join("config.json");
 
-        // Assume config.json is always available; read directly
         let config_content = fs::read_to_string(&config_path).expect(
             "Failed to read config.json. Ensure the file exists in the executable directory.",
         );
@@ -259,10 +258,10 @@ impl FileInspectorApp {
                 file_hash: "N/A (Directory)".into(),
                 cached_at: format_system_time(SystemTime::now()),
                 is_directory: true,
-                tags: vec![],
+                tags: vec!["Directory".into()],
             };
 
-            self.tag_input_buffer.clear();
+            self.tag_input_buffer = dir_info.tags.join(", ");
             self.current_file = Some(dir_info);
             self.status_message =
                 "Directory inspected successfully (config rules applied).".to_string();
@@ -297,6 +296,14 @@ impl FileInspectorApp {
         } else {
             format!("{} file", extension.to_uppercase())
         };
+
+        // Extract creation year and month, and construct automatic initial tags
+        let mut initial_tags = vec![file_type.clone()];
+        if let Ok(created_time) = metadata.created() {
+            let datetime: chrono::DateTime<chrono::Local> = created_time.into();
+            initial_tags.push(datetime.format("%Y").to_string());
+            initial_tags.push(datetime.format("%B").to_string());
+        }
 
         let created_at = metadata
             .created()
@@ -370,17 +377,17 @@ impl FileInspectorApp {
             file_hash: file_hash.clone(),
             cached_at,
             is_directory: false,
-            tags: vec![],
+            tags: initial_tags,
         };
 
-        self.tag_input_buffer.clear();
+        self.tag_input_buffer = file_info.tags.join(", ");
         self.file_hash_map
             .insert(file_hash.clone(), path.to_string_lossy().into_owned());
         self.save_metadata_to_cache(&file_hash, &file_info);
 
         self.current_file = Some(file_info);
         self.status_message =
-            "File inspected and recorded to local JSON cache successfully.".to_string();
+            "File indexed with automatic tags (filetype, year, month) successfully.".to_string();
     }
 
     fn save_current_tags(&mut self) {
@@ -388,7 +395,7 @@ impl FileInspectorApp {
             let parsed_tags: Vec<String> = self
                 .tag_input_buffer
                 .split(',')
-                .map(|s| s.trim().to_string())
+                .map(|s| s.trim().to_string().to_ascii_lowercase())
                 .filter(|s| !s.is_empty())
                 .collect();
 
@@ -607,7 +614,7 @@ impl eframe::App for FileInspectorApp {
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("Windows 11 File Inspector");
+            ui.heading("File Inspector - Rust");
             ui.add_space(8.0);
 
             ui.horizontal(|ui| {
@@ -624,7 +631,6 @@ impl eframe::App for FileInspectorApp {
 
             ui.add_space(6.0);
 
-            // Search Bar for `file_index.json`
             ui.horizontal(|ui| {
                 ui.label("🔍 Search Index (Filename / Tags):");
                 ui.add(egui::TextEdit::singleline(&mut self.search_query).desired_width(300.0));
@@ -633,7 +639,6 @@ impl eframe::App for FileInspectorApp {
                 }
             });
 
-            // Display Search Results if query is active (using in-memory cached_index to prevent flicker)
             if !self.search_query.is_empty() {
                 let query = self.search_query.to_lowercase();
                 let matches: Vec<FileMetadataInfo> = self.cached_index
