@@ -105,7 +105,7 @@ impl Default for AppConfig {
 fn main() -> Result<(), eframe::Error> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([850.0, 720.0])
+            .with_inner_size([900.0, 750.0])
             .with_drag_and_drop(true),
         ..Default::default()
     };
@@ -130,7 +130,6 @@ struct FileMetadataInfo {
     file_hash: String,
     cached_at: String,
     is_directory: bool,
-    tags: Vec<String>,
 }
 
 struct FileInspectorApp {
@@ -140,7 +139,6 @@ struct FileInspectorApp {
     config_path: PathBuf,
     file_hash_map: HashMap<String, String>,
     config: AppConfig,
-    tag_input_buffer: String,
 }
 
 impl Default for FileInspectorApp {
@@ -172,7 +170,6 @@ impl Default for FileInspectorApp {
             config_path,
             file_hash_map,
             config,
-            tag_input_buffer: String::new(),
         }
     }
 }
@@ -255,10 +252,8 @@ impl FileInspectorApp {
                 file_hash: "N/A (Directory)".into(),
                 cached_at: format_system_time(SystemTime::now()),
                 is_directory: true,
-                tags: vec![],
             };
 
-            self.tag_input_buffer.clear();
             self.current_file = Some(dir_info);
             self.status_message =
                 "Directory inspected successfully (config rules applied).".to_string();
@@ -274,7 +269,6 @@ impl FileInspectorApp {
         };
 
         if let Some(cached_info) = self.load_cached_metadata(&file_hash) {
-            self.tag_input_buffer = cached_info.tags.join(", ");
             self.current_file = Some(cached_info);
             self.status_message =
                 "Loaded file details instantly from local JSON cache (Hash match).".to_string();
@@ -366,10 +360,8 @@ impl FileInspectorApp {
             file_hash: file_hash.clone(),
             cached_at,
             is_directory: false,
-            tags: vec![],
         };
 
-        self.tag_input_buffer.clear();
         self.file_hash_map
             .insert(file_hash.clone(), path.to_string_lossy().into_owned());
         self.save_metadata_to_cache(&file_hash, &file_info);
@@ -377,31 +369,6 @@ impl FileInspectorApp {
         self.current_file = Some(file_info);
         self.status_message =
             "File inspected and recorded to local JSON cache successfully.".to_string();
-    }
-
-    fn save_current_tags(&mut self) {
-        if let Some(file_info) = &mut self.current_file {
-            let parsed_tags: Vec<String> = self
-                .tag_input_buffer
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
-
-            file_info.tags = parsed_tags;
-
-            if file_info.is_directory {
-                self.status_message =
-                    "Tags updated in current view (Directories are not cached by hash)."
-                        .to_string();
-            } else {
-                let hash = file_info.file_hash.clone();
-                let info_clone = file_info.clone();
-                self.save_metadata_to_cache(&hash, &info_clone);
-                self.status_message =
-                    "Tags successfully updated and saved to file_index.json!".to_string();
-            }
-        }
     }
 
     fn load_cached_metadata(&self, hash: &str) -> Option<FileMetadataInfo> {
@@ -617,6 +584,7 @@ fn format_file_size(bytes: u64) -> String {
 
 impl eframe::App for FileInspectorApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        ctx.set_pixels_per_point(1.7);
         ctx.input(|i| {
             if !i.raw.dropped_files.is_empty() {
                 if let Some(file) = i.raw.dropped_files.first() {
@@ -646,22 +614,10 @@ impl eframe::App for FileInspectorApp {
             ui.separator();
             ui.add_space(4.0);
 
-            // Extract values upfront if current_file is present to avoid borrowing `self` immutably for too long
             if let Some(file_info) = &self.current_file {
-                let is_directory = file_info.is_directory;
-                let name = file_info.name.clone();
-                let path_str = file_info.path.to_string_lossy().to_string();
-                let file_hash = file_info.file_hash.clone();
-                let file_type = file_info.file_type.clone();
-                let size_bytes = file_info.size_bytes;
-                let created_at = file_info.created_at.clone();
-                let modified_at = file_info.modified_at.clone();
-                let tags = file_info.tags.clone();
-                let extra_details = file_info.extra_details.clone();
-
                 ui.group(|ui| {
                     ui.set_width(ui.available_width());
-                    ui.strong(if is_directory { "Directory Attributes" } else { "General Attributes" });
+                    ui.strong(if file_info.is_directory { "Directory Attributes" } else { "General Attributes" });
                     ui.add_space(4.0);
 
                     egui::Grid::new("file_meta_grid")
@@ -670,67 +626,40 @@ impl eframe::App for FileInspectorApp {
                         .striped(true)
                         .show(ui, |ui| {
                             ui.label("Name");
-                            ui.add(egui::Label::new(&name).wrap());
+                            ui.add(egui::Label::new(&file_info.name).wrap());
                             ui.end_row();
 
                             ui.label("Full Path");
-                            ui.add(egui::Label::new(path_str).wrap().sense(egui::Sense::hover()));
+                            ui.add(egui::Label::new(file_info.path.to_string_lossy().to_string()).wrap().sense(egui::Sense::hover()));
                             ui.end_row();
 
-                            if !is_directory {
+                            if !file_info.is_directory {
                                 ui.label("SHA-256 Hash");
-                                ui.add(egui::Label::new(&file_hash).wrap());
+                                ui.add(egui::Label::new(&file_info.file_hash).wrap());
                                 ui.end_row();
                             }
 
                             ui.label("Type");
-                            ui.label(&file_type);
+                            ui.label(&file_info.file_type);
                             ui.end_row();
 
                             ui.label("Size");
-                            ui.label(format!("{} ({} bytes)", format_file_size(size_bytes), size_bytes));
+                            ui.label(format!("{} ({} bytes)", format_file_size(file_info.size_bytes), file_info.size_bytes));
                             ui.end_row();
 
                             ui.label("Created At");
-                            ui.label(&created_at);
+                            ui.label(&file_info.created_at);
                             ui.end_row();
 
                             ui.label("Last Modified");
-                            ui.label(&modified_at);
+                            ui.label(&file_info.modified_at);
                             ui.end_row();
                         });
                 });
 
                 ui.add_space(10.0);
 
-                // Custom Tag Management Section (Now safely able to mutate `self` via `self.save_current_tags()`)
-                ui.group(|ui| {
-                    ui.set_width(ui.available_width());
-                    ui.strong("Custom Tags Management");
-                    ui.add_space(4.0);
-
-                    ui.horizontal(|ui| {
-                        ui.label("Tags (comma separated):");
-                        ui.add(egui::TextEdit::singleline(&mut self.tag_input_buffer).desired_width(350.0));
-                        if ui.button("💾 Save Tags").clicked() {
-                            self.save_current_tags();
-                        }
-                    });
-
-                    if !tags.is_empty() {
-                        ui.add_space(4.0);
-                        ui.horizontal(|ui| {
-                            ui.label("Current Tags:");
-                            for tag in &tags {
-                                ui.add(egui::Label::new(format!("[{}]", tag)));
-                            }
-                        });
-                    }
-                });
-
-                ui.add_space(10.0);
-
-                if !extra_details.is_empty() {
+                if !file_info.extra_details.is_empty() {
                     ui.group(|ui| {
                         ui.set_width(ui.available_width());
                         ui.strong("Parsed Format Metadata");
@@ -741,7 +670,7 @@ impl eframe::App for FileInspectorApp {
                             .spacing([40.0, 6.0])
                             .striped(true)
                             .show(ui, |ui| {
-                                for (key, val) in &extra_details {
+                                for (key, val) in &file_info.extra_details {
                                     ui.label(key);
                                     ui.add(egui::Label::new(val).wrap());
                                     ui.end_row();
