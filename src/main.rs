@@ -96,7 +96,13 @@ impl Default for AppConfig {
                 ],
             },
             included_files: vec!["important.txt".into(), "config.toml".into()],
-            excluded_files: vec![".DS_Store".into(), "Thumbs.db".into(), "desktop.ini".into()],
+            excluded_files: vec![
+                ".DS_Store".into(),
+                "Thumbs.db".into(),
+                "desktop.ini".into(),
+                "*.meta".into(),
+                "*.log".into(),
+            ],
             ignored_folders: vec![
                 ".git".into(),
                 "node_modules".into(),
@@ -105,6 +111,10 @@ impl Default for AppConfig {
                 ".idea".into(),
                 "dist".into(),
                 "build".into(),
+                "Library".into(),
+                "Logs".into(),
+                "Obj".into(),
+                "UserSettings".into(),
             ],
         }
     }
@@ -122,7 +132,7 @@ fn main() -> Result<(), eframe::Error> {
     };
 
     eframe::run_native(
-        "Advanced File Inspector - SQLite Edition",
+        "Advanced File Inspector",
         options,
         Box::new(|_cc| Ok(Box::new(FileInspectorApp::default()))),
     )
@@ -393,13 +403,8 @@ impl FileInspectorApp {
             .to_string_lossy()
             .into_owned();
 
-        if !metadata.is_dir() && self.config.excluded_files.contains(&file_name) {
-            self.status_message = format!(
-                "Skipped: '{}' is explicitly excluded in configuration.",
-                file_name
-            );
-            return;
-        }
+        // Note: Exclusions/ignores are intentionally NOT applied here for direct parent paths,
+        // allowing direct inspection/indexing of folders like "Library", "build", or files like "*.meta".
 
         if metadata.is_dir() {
             let name = file_name;
@@ -659,6 +664,35 @@ impl FileInspectorApp {
     }
 }
 
+fn is_file_excluded(file_name: &str, extension: &str, excluded_patterns: &[String]) -> bool {
+    for pattern in excluded_patterns {
+        if pattern.starts_with("*.") {
+            let ext_target = &pattern[2..].to_lowercase();
+            if extension == ext_target {
+                return true;
+            }
+        } else if pattern.starts_with('*') && pattern.ends_with('*') {
+            let sub = &pattern[1..pattern.len() - 1];
+            if file_name.contains(sub) {
+                return true;
+            }
+        } else if pattern.starts_with('*') {
+            let suf = &pattern[1..];
+            if file_name.ends_with(suf) {
+                return true;
+            }
+        } else if pattern.ends_with('*') {
+            let pref = &pattern[0..pattern.len() - 1];
+            if file_name.starts_with(pref) {
+                return true;
+            }
+        } else if file_name == pattern {
+            return true;
+        }
+    }
+    false
+}
+
 fn index_directory_recursive(
     dir_path: &Path,
     config: &AppConfig,
@@ -678,6 +712,7 @@ fn index_directory_recursive(
             let file_name = entry.file_name().to_string_lossy().into_owned();
 
             if entry_path.is_dir() {
+                // Apply ignored_folders check only to child subdirectories
                 if config.ignored_folders.iter().any(|ig| ig == &file_name) {
                     continue;
                 }
@@ -693,18 +728,20 @@ fn index_directory_recursive(
                 }
             } else if entry_path.is_file() {
                 total_files += 1;
-                let _ = tx.send(IndexProgress::Progress(file_name.clone()));
-
-                if config.excluded_files.contains(&file_name) {
-                    *unindexed_types.entry("Excluded File".into()).or_insert(0) += 1;
-                    continue;
-                }
 
                 let extension = entry_path
                     .extension()
                     .unwrap_or_default()
                     .to_string_lossy()
                     .to_lowercase();
+
+                // Apply enhanced wildcard matching for excluded_files check on child files
+                if is_file_excluded(&file_name, &extension, &config.excluded_files) {
+                    *unindexed_types.entry("Excluded File".into()).or_insert(0) += 1;
+                    continue;
+                }
+
+                let _ = tx.send(IndexProgress::Progress(file_name.clone()));
 
                 if extension.is_empty() {
                     *unknown_types.entry("No Extension".into()).or_insert(0) += 1;
@@ -1009,7 +1046,7 @@ impl eframe::App for FileInspectorApp {
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("File Inspector (SQLite & Multi-Search)");
+            ui.heading("File Inspector");
             ui.add_space(6.0);
 
             ui.horizontal(|ui| {
@@ -1034,10 +1071,10 @@ impl eframe::App for FileInspectorApp {
                 ui.horizontal(|ui| {
                     ui.label(
                         egui::RichText::new(format!(
-                            "Processing: {}",
+                            "Processing(hashing/parsing): {}",
                             self.current_indexing_file
                         ))
-                        .color(egui::Color32::CYAN),
+                        .color(egui::Color32::YELLOW),
                     );
                 });
             }
@@ -1092,10 +1129,10 @@ impl eframe::App for FileInspectorApp {
                         if matches.is_empty() {
                             ui.label(egui::RichText::new("No matching indexed files found.").italics().color(egui::Color32::GRAY));
                         } else {
-                            egui::ScrollArea::vertical().max_height(140.0).show(ui, |ui| {
+                            egui::ScrollArea::vertical().max_height(240.0).show(ui, |ui| {
                                 for file_info in matches {
                                     ui.horizontal(|ui| {
-                                        if ui.button("📂 Select").clicked() {
+                                        if ui.button("👆").clicked() {
                                             let path = file_info.path.clone();
                                             self.inspect_path(path);
                                         }
