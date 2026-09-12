@@ -586,6 +586,73 @@ impl FileInspectorApp {
             }
         }
     }
+
+    fn update_current_file_metadata(&mut self) {
+        if let Some(file_info) = &mut self.current_file {
+            if file_info.is_directory {
+                self.status_message =
+                    "Metadata updates are currently only supported for files.".to_string();
+                return;
+            }
+
+            let path = file_info.path.clone();
+            let extension = file_info.extension.clone();
+            let mut extra_details = Vec::new();
+
+            if self.config.included_files.contains(&file_info.name) {
+                extra_details.push((
+                    "Config Status".into(),
+                    "Explicitly Included Priority File".into(),
+                ));
+            }
+
+            if self
+                .config
+                .search_criteria
+                .image_extensions
+                .contains(&extension)
+            {
+                if let Ok(dims) = image::image_dimensions(&path) {
+                    extra_details.push(("Width".into(), format!("{} px", dims.0)));
+                    extra_details.push(("Height".into(), format!("{} px", dims.1)));
+                    extra_details.push((
+                        "Aspect Ratio".into(),
+                        format!("{:.2}", dims.0 as f32 / dims.1 as f32),
+                    ));
+                }
+            }
+
+            if self
+                .config
+                .search_criteria
+                .media_extensions
+                .contains(&extension)
+            {
+                extra_details.extend(get_media_info_via_ffprobe(&path));
+            }
+
+            if self
+                .config
+                .search_criteria
+                .text_extensions
+                .contains(&extension)
+            {
+                if let Ok(text_stats) =
+                    analyze_text_file(&path, &extension, &self.config.language_extensions)
+                {
+                    extra_details.push(("Language Type".into(), text_stats.language));
+                    extra_details.push(("Lines of Code (LOC)".into(), text_stats.loc.to_string()));
+                    extra_details.push(("Total Characters".into(), text_stats.chars.to_string()));
+                }
+            }
+
+            file_info.extra_details = extra_details;
+            let info_clone = file_info.clone();
+            self.save_to_db(&info_clone);
+            self.status_message =
+                "Metadata re-extracted and updated in SQLite database successfully!".to_string();
+        }
+    }
 }
 
 fn index_directory_recursive(
@@ -1032,28 +1099,14 @@ impl eframe::App for FileInspectorApp {
 
                         ui.horizontal(|ui| {
                             ui.label("Tags (comma separated):");
-                            ui.add(egui::TextEdit::singleline(&mut self.tag_input_buffer).desired_width(300.0));
-                            if ui.button("💾 Save Tags").clicked() {
-                                self.save_current_tags();
-                            }
-                            if ui.button("📤 Export Tag Results").clicked() {
-                                let current_tags: Vec<String> = self.tag_input_buffer
-                                    .split(',')
-                                    .map(|s| s.trim().to_lowercase())
-                                    .filter(|s| !s.is_empty())
-                                    .collect();
-
-                                let filtered_by_tags: Vec<FileMetadataInfo> = all_files
-                                    .iter()
-                                    .filter(|f| {
-                                        current_tags.iter().any(|ct| f.tags.iter().any(|ft| ft.to_lowercase().contains(ct)))
-                                    })
-                                    .cloned()
-                                    .collect();
-
-                                self.export_to_json(&filtered_by_tags, "filtered_by_tags");
-                            }
-                        });
+                                ui.add(egui::TextEdit::singleline(&mut self.tag_input_buffer).desired_width(300.0));
+                                if ui.button("💾 Save Tags").clicked() {
+                                    self.save_current_tags();
+                                }
+                                if ui.button("🔄 Update Metadata").clicked() {
+                                    self.update_current_file_metadata();
+                                }
+                            });
 
                         if !tags.is_empty() {
                             ui.add_space(4.0);
