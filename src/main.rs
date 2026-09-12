@@ -1,7 +1,7 @@
 use eframe::egui;
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -195,6 +195,8 @@ struct FileInspectorApp {
     config: AppConfig,
     tag_input_buffer: String,
     search_query: String,
+    and_query: String,
+    or_query: String,
     is_indexing: bool,
     indexing_rx: Option<Receiver<IndexProgress>>,
     current_indexing_file: String,
@@ -226,6 +228,8 @@ impl Default for FileInspectorApp {
             config,
             tag_input_buffer: String::new(),
             search_query: String::new(),
+            and_query: String::new(),
+            or_query: String::new(),
             is_indexing: false,
             indexing_rx: None,
             current_indexing_file: String::new(),
@@ -385,6 +389,112 @@ impl FileInspectorApp {
                 }
             } else {
                 self.status_message = "Failed to serialize items to JSON.".to_string();
+            }
+        }
+    }
+
+    fn parse_all_scanned(&mut self) {
+        let all_files = self.fetch_all_from_db();
+        let mut count = 0;
+
+        for mut file_info in all_files {
+            if file_info.tags.iter().any(|t| t == "scanned") {
+                let path = file_info.path.clone();
+                let extension = file_info.extension.clone();
+
+                file_info.file_type = if extension.is_empty() {
+                    "unknown / binary".to_string()
+                } else {
+                    format!("{} file", extension).to_lowercase()
+                };
+
+                let mut unique_tags: HashSet<String> = HashSet::new();
+                for tag in &file_info.tags {
+                    let cleaned = tag.trim().to_lowercase();
+                    if !cleaned.is_empty() && cleaned != "scanned" {
+                        unique_tags.insert(cleaned);
+                    }
+                }
+
+                unique_tags.insert(file_info.file_type.clone());
+                unique_tags.insert("parsed".to_string());
+
+                if let Ok(metadata) = fs::metadata(&path) {
+                    if let Ok(modified_time) = metadata.modified() {
+                        let datetime: chrono::DateTime<chrono::Local> = modified_time.into();
+                        unique_tags.insert(datetime.format("%Y").to_string().to_lowercase());
+                        unique_tags.insert(datetime.format("%B").to_string().to_lowercase());
+                    }
+                }
+
+                let mut updated_tags: Vec<String> = unique_tags.into_iter().collect();
+                updated_tags.sort();
+                file_info.tags = updated_tags;
+
+                let mut extra_details = Vec::new();
+
+                if self.config.included_files.contains(&file_info.name) {
+                    extra_details.push((
+                        "Config Status".into(),
+                        "Explicitly Included Priority File".into(),
+                    ));
+                }
+
+                if self
+                    .config
+                    .search_criteria
+                    .image_extensions
+                    .contains(&extension)
+                {
+                    if let Ok(dims) = image::image_dimensions(&path) {
+                        extra_details.push(("Width".into(), format!("{} px", dims.0)));
+                        extra_details.push(("Height".into(), format!("{} px", dims.1)));
+                        extra_details.push((
+                            "Aspect Ratio".into(),
+                            format!("{:.2}", dims.0 as f32 / dims.1 as f32),
+                        ));
+                    }
+                }
+
+                if self
+                    .config
+                    .search_criteria
+                    .media_extensions
+                    .contains(&extension)
+                {
+                    extra_details.extend(get_media_info_via_ffprobe(&path));
+                }
+
+                if self
+                    .config
+                    .search_criteria
+                    .text_extensions
+                    .contains(&extension)
+                {
+                    if let Ok(text_stats) =
+                        analyze_text_file(&path, &extension, &self.config.language_extensions)
+                    {
+                        extra_details.push(("Language Type".into(), text_stats.language));
+                        extra_details
+                            .push(("Lines of Code (LOC)".into(), text_stats.loc.to_string()));
+                        extra_details
+                            .push(("Total Characters".into(), text_stats.chars.to_string()));
+                    }
+                }
+
+                file_info.extra_details = extra_details;
+                self.save_to_db(&file_info);
+                count += 1;
+            }
+        }
+
+        self.status_message = format!("Successfully parsed {} scanned files.", count);
+
+        if let Some(curr) = &self.current_file {
+            let h = curr.file_hash.clone();
+            self.current_file = self.get_from_db(&h);
+            if let Some(c) = &self.current_file {
+                self.tag_input_buffer = c.tags.join(", ");
             }
         }
     }
@@ -621,14 +731,31 @@ impl FileInspectorApp {
                 format!("{} file", extension).to_lowercase()
             };
 
-            for tag in &mut file_info.tags {
-                *tag = tag.to_lowercase();
+            let mut unique_tags: HashSet<String> = HashSet::new();
+
+            for tag in &file_info.tags {
+                let cleaned = tag.trim().to_lowercase();
+                if !cleaned.is_empty() {
+                    unique_tags.insert(cleaned);
+                }
             }
-            if let Some(pos) = file_info.tags.iter().position(|t| t == "scanned") {
-                file_info.tags[pos] = "parsed".to_string();
-            } else if !file_info.tags.contains(&"parsed".to_string()) {
-                file_info.tags.push("parsed".to_string());
+
+            unique_tags.insert(file_info.file_type.clone());
+            unique_tags.insert("parsed".to_string());
+
+            if let Ok(metadata) = fs::metadata(&path) {
+                if let Ok(modified_time) = metadata.modified() {
+                    let datetime: chrono::DateTime<chrono::Local> = modified_time.into();
+                    unique_tags.insert(datetime.format("%Y").to_string().to_lowercase());
+                    unique_tags.insert(datetime.format("%B").to_string().to_lowercase());
+                }
             }
+
+            let mut updated_tags: Vec<String> = unique_tags.into_iter().collect();
+            updated_tags.sort();
+            file_info.tags = updated_tags;
+
+            self.tag_input_buffer = file_info.tags.join(", ");
 
             let mut extra_details = Vec::new();
 
@@ -1084,6 +1211,9 @@ impl eframe::App for FileInspectorApp {
                         let all_items = self.fetch_all_from_db();
                         self.export_to_json(&all_items, "whole_database");
                     }
+                    if ui.button("⚡ Parse All").clicked() {
+                        self.parse_all_scanned();
+                    }
                 });
 
                 ui.add_space(4.0);
@@ -1109,13 +1239,44 @@ impl eframe::App for FileInspectorApp {
                     }
                 });
 
+                ui.horizontal(|ui| {
+                    ui.label("➕ AND:");
+                    ui.add(egui::TextEdit::singleline(&mut self.and_query).desired_width(203.0));
+                    if !self.and_query.is_empty() && ui.button("Clear").clicked() {
+                        self.and_query.clear();
+                    }
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label("🔀 OR:");
+                    ui.add(egui::TextEdit::singleline(&mut self.or_query).desired_width(211.0));
+                    if !self.or_query.is_empty() && ui.button("Clear").clicked() {
+                        self.or_query.clear();
+                    }
+                });
+
                 ui.add_space(6.0);
                 ui.strong("Search Results");
                 ui.add_space(4.0);
 
                 let all_files = self.fetch_all_from_db();
+
                 let terms: Vec<String> = self
                     .search_query
+                    .split(',')
+                    .map(|s| s.trim().to_lowercase())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+
+                let and_terms: Vec<String> = self
+                    .and_query
+                    .split(',')
+                    .map(|s| s.trim().to_lowercase())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+
+                let or_terms: Vec<String> = self
+                    .or_query
                     .split(',')
                     .map(|s| s.trim().to_lowercase())
                     .filter(|s| !s.is_empty())
@@ -1124,16 +1285,27 @@ impl eframe::App for FileInspectorApp {
                 let matches: Vec<FileMetadataInfo> = all_files
                     .iter()
                     .filter(|info| {
-                        if terms.is_empty() {
-                            return true;
-                        }
-                        terms.iter().any(|term| {
+                        let matches_term = |term: &str| {
                             let name_match = info.name.to_lowercase().contains(term);
                             let tag_match =
                                 info.tags.iter().any(|t| t.to_lowercase().contains(term));
-                            let ext_match = info.extension.to_lowercase() == *term;
+                            let ext_match = info.extension.to_lowercase() == term;
                             name_match || tag_match || ext_match
-                        })
+                        };
+
+                        if !terms.is_empty() && !terms.iter().any(|t| matches_term(t)) {
+                            return false;
+                        }
+
+                        if !and_terms.is_empty() && !and_terms.iter().all(|t| matches_term(t)) {
+                            return false;
+                        }
+
+                        if !or_terms.is_empty() && !or_terms.iter().any(|t| matches_term(t)) {
+                            return false;
+                        }
+
+                        true
                     })
                     .cloned()
                     .collect();
@@ -1164,7 +1336,7 @@ impl eframe::App for FileInspectorApp {
                                 }
                                 let short_name = Self::truncate_name(&file_info.name, 15);
                                 let display_str =
-                                    format!("{} [{}]", short_name, file_info.tags.join(", "));
+                                    format!("[{}] {}", file_info.tags.join(", "), short_name);
 
                                 let mut text = egui::RichText::new(display_str);
                                 if is_selected {
