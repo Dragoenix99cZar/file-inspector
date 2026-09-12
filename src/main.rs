@@ -120,7 +120,7 @@ impl Default for AppConfig {
     }
 }
 
-const WIDTH: f32 = 950.0;
+const WIDTH: f32 = 1100.0;
 const HEIGHT: f32 = 780.0;
 
 fn main() -> Result<(), eframe::Error> {
@@ -184,11 +184,13 @@ impl Default for FileInspectorApp {
         let db_path = exe_dir.join("file_inspector.db");
         let config_path = exe_dir.join("config.json");
 
-        let config_content = fs::read_to_string(&config_path).expect(
-            "Failed to read config.json. Ensure the file exists in the executable directory.",
-        );
-        let config: AppConfig = serde_json::from_str(&config_content)
-            .expect("Failed to parse config.json. Check syntax.");
+        let config_content = fs::read_to_string(&config_path).unwrap_or_else(|_| {
+            let default_cfg = AppConfig::default();
+            let serialized = serde_json::to_string_pretty(&default_cfg).unwrap();
+            let _ = fs::write(&config_path, &serialized);
+            serialized
+        });
+        let config: AppConfig = serde_json::from_str(&config_content).unwrap_or_default();
 
         let app = Self {
             current_file: None,
@@ -234,16 +236,21 @@ impl FileInspectorApp {
         }
     }
 
+    fn truncate_name(name: &str, max_len: usize) -> String {
+        if name.chars().count() > max_len {
+            let truncated: String = name.chars().take(max_len).collect();
+            format!("{}...", truncated)
+        } else {
+            name.to_string()
+        }
+    }
+
     fn reload_config(&mut self) {
         let content = fs::read_to_string(&self.config_path).unwrap_or_default();
         if let Ok(parsed) = serde_json::from_str::<AppConfig>(&content) {
             self.config = parsed;
             self.status_message =
                 "Configuration reloaded successfully from config.json.".to_string();
-        } else if let Ok(parsed) = serde_json::from_str(&content) {
-            self.config = parsed;
-            self.status_message =
-                "Configuration reloaded successfully from config file.".to_string();
         } else {
             self.status_message = "Failed to reload configuration (syntax error).".to_string();
         }
@@ -402,9 +409,6 @@ impl FileInspectorApp {
             .unwrap_or_default()
             .to_string_lossy()
             .into_owned();
-
-        // Note: Exclusions/ignores are intentionally NOT applied here for direct parent paths,
-        // allowing direct inspection/indexing of folders like "Library", "build", or files like "*.meta".
 
         if metadata.is_dir() {
             let name = file_name;
@@ -712,7 +716,6 @@ fn index_directory_recursive(
             let file_name = entry.file_name().to_string_lossy().into_owned();
 
             if entry_path.is_dir() {
-                // Apply ignored_folders check only to child subdirectories
                 if config.ignored_folders.iter().any(|ig| ig == &file_name) {
                     continue;
                 }
@@ -735,7 +738,6 @@ fn index_directory_recursive(
                     .to_string_lossy()
                     .to_lowercase();
 
-                // Apply enhanced wildcard matching for excluded_files check on child files
                 if is_file_excluded(&file_name, &extension, &config.excluded_files) {
                     *unindexed_types.entry("Excluded File".into()).or_insert(0) += 1;
                     continue;
@@ -978,7 +980,9 @@ impl eframe::App for FileInspectorApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.set_pixels_per_point(1.7);
 
+        // Handle indexing background worker progress
         if let Some(rx) = &self.indexing_rx {
+            ctx.request_repaint();
             match rx.try_recv() {
                 Ok(IndexProgress::Progress(filename)) => {
                     self.current_indexing_file = filename;
@@ -1045,108 +1049,134 @@ impl eframe::App for FileInspectorApp {
             }
         });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("File Inspector");
-            ui.add_space(6.0);
+        // 1. LEFT PANEL: Search Results & Query Controls
+        egui::SidePanel::right("search_results_panel")
+            .default_width(360.0)
+            .resizable(true)
+            .show(ctx, |ui| {
+                ui.heading("Search & Explorer");
+                ui.add_space(6.0);
 
-            ui.horizontal(|ui| {
-                if ui.button("📁 Browse...").clicked() {
-                    if let Some(path) = rfd::FileDialog::new().pick_file() {
-                        self.inspect_path(path);
-                    }
-                }
-                if ui.button("🔄 Reload Config").clicked() {
-                    self.reload_config();
-                }
-
-                if ui.button("📤 Export Whole DB").clicked() {
-                    let all_items = self.fetch_all_from_db();
-                    self.export_to_json(&all_items, "whole_database");
-                }
-                ui.label(&self.status_message);
-            });
-
-            if self.is_indexing {
-                ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "Processing(hashing/parsing): {}",
-                            self.current_indexing_file
-                        ))
-                        .color(egui::Color32::YELLOW),
-                    );
-                });
-            }
-
-            ui.add_space(6.0);
-
-            ui.horizontal(|ui| {
-                ui.label("🔍 Search (comma-separated, e.g. jpg, 2025):");
-                ui.add(egui::TextEdit::singleline(&mut self.search_query).desired_width(280.0));
-                if !self.search_query.is_empty() && ui.button("Clear").clicked() {
-                    self.search_query.clear();
-                }
-            });
-
-            egui::ScrollArea::vertical().max_height(HEIGHT - 50.0).show(ui, |ui| {
-                let all_files = self.fetch_all_from_db();
-
-                if !self.search_query.is_empty() {
-                    let terms: Vec<String> = self.search_query
-                        .split(',')
-                        .map(|s| s.trim().to_lowercase())
-                        .filter(|s| !s.is_empty())
-                        .collect();
-
-                    let matches: Vec<FileMetadataInfo> = all_files
-                        .iter()
-                        .filter(|info| {
-                            if terms.is_empty() {
-                                return false;
-                            }
-                            terms.iter().any(|term| {
-                                let name_match = info.name.to_lowercase().contains(term);
-                                let tag_match = info.tags.iter().any(|t| t.to_lowercase().contains(term));
-                                let ext_match = info.extension.to_lowercase() == *term;
-                                name_match || tag_match || ext_match
-                            })
-                        })
-                        .cloned()
-                        .collect();
-
-                    ui.add_space(4.0);
-                    ui.group(|ui| {
-                        ui.set_width(ui.available_width());
-                        ui.horizontal(|ui| {
-                            ui.strong(format!("Search Results ({} found)", matches.len()));
-                            if ui.button("📤 Export Search Results").clicked() {
-                                self.export_to_json(&matches, "search_results");
-                            }
-                        });
-                        ui.add_space(4.0);
-
-                        if matches.is_empty() {
-                            ui.label(egui::RichText::new("No matching indexed files found.").italics().color(egui::Color32::GRAY));
-                        } else {
-                            egui::ScrollArea::vertical().max_height(240.0).show(ui, |ui| {
-                                for file_info in matches {
-                                    ui.horizontal(|ui| {
-                                        if ui.button("👆").clicked() {
-                                            let path = file_info.path.clone();
-                                            self.inspect_path(path);
-                                        }
-                                        ui.label(format!("{} [{}]", file_info.name, file_info.tags.join(", ")));
-                                    });
-                                }
-                            });
+                    if ui.button("📁 Browse...").clicked() {
+                        if let Some(path) = rfd::FileDialog::new().pick_file() {
+                            self.inspect_path(path);
                         }
-                    });
+                    }
+                    if ui.button("🔄 Reload").clicked() {
+                        self.reload_config();
+                    }
+                    if ui.button("📤 Export DB").clicked() {
+                        let all_items = self.fetch_all_from_db();
+                        self.export_to_json(&all_items, "whole_database");
+                    }
+                });
+
+                ui.add_space(4.0);
+                ui.label(&self.status_message);
+
+                if self.is_indexing {
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(format!("Processing: {}", self.current_indexing_file))
+                            .color(egui::Color32::YELLOW),
+                    );
                 }
 
+                ui.add_space(8.0);
                 ui.separator();
                 ui.add_space(4.0);
 
+                ui.horizontal(|ui| {
+                    ui.label("🔍 Query:");
+                    ui.add(egui::TextEdit::singleline(&mut self.search_query).desired_width(190.0));
+                    if !self.search_query.is_empty() && ui.button("Clear").clicked() {
+                        self.search_query.clear();
+                    }
+                });
+
+                ui.add_space(6.0);
+                ui.strong("Search Results");
+                ui.add_space(4.0);
+
+                let all_files = self.fetch_all_from_db();
+                let terms: Vec<String> = self
+                    .search_query
+                    .split(',')
+                    .map(|s| s.trim().to_lowercase())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+
+                let matches: Vec<FileMetadataInfo> = all_files
+                    .iter()
+                    .filter(|info| {
+                        if terms.is_empty() {
+                            return true; // Show all if search query is empty
+                        }
+                        terms.iter().any(|term| {
+                            let name_match = info.name.to_lowercase().contains(term);
+                            let tag_match =
+                                info.tags.iter().any(|t| t.to_lowercase().contains(term));
+                            let ext_match = info.extension.to_lowercase() == *term;
+                            name_match || tag_match || ext_match
+                        })
+                    })
+                    .cloned()
+                    .collect();
+
+                if !matches.is_empty() {
+                    if ui.button("📤 Export Current Results").clicked() {
+                        self.export_to_json(&matches, "search_results");
+                    }
+                }
+
+                ui.add_space(4.0);
+
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    if matches.is_empty() {
+                        ui.label(
+                            egui::RichText::new("No indexed files found matching query.")
+                                .italics()
+                                .color(egui::Color32::GRAY),
+                        );
+                    } else {
+                        for file_info in matches {
+                            // Check if this file is currently inspected
+                            let is_selected = self
+                                .current_file
+                                .as_ref()
+                                .map_or(false, |curr| curr.file_hash == file_info.file_hash);
+
+                            ui.horizontal(|ui| {
+                                if ui.button("👆").clicked() {
+                                    let path = file_info.path.clone();
+                                    self.inspect_path(path);
+                                }
+                                // Truncate name to 15 characters and display format/tags details
+                                let short_name = Self::truncate_name(&file_info.name, 15);
+                                let display_str = format!(
+                                    "{} [{}, {}]",
+                                    short_name,
+                                    file_info.file_type,
+                                    file_info.tags.join(", ")
+                                );
+
+                                // Style the text differently if selected
+                                let mut text = egui::RichText::new(display_str);
+                                if is_selected {
+                                    text = text.color(egui::Color32::LIGHT_BLUE).strong();
+                                }
+
+                                ui.label(text);
+                            });
+                        }
+                    }
+                });
+            });
+
+        // 2. RIGHT PANEL (CentralPanel): General Attributes, Custom Tags Management, Parsed Format Metadata
+        egui::CentralPanel::default().show(ctx, |ui| {
+            egui::ScrollArea::vertical().show(ui, |ui| {
                 if let Some(file_info) = &self.current_file {
                     let is_directory = file_info.is_directory;
                     let name = file_info.name.clone();
@@ -1159,6 +1189,7 @@ impl eframe::App for FileInspectorApp {
                     let tags = file_info.tags.clone();
                     let extra_details = file_info.extra_details.clone();
 
+                    // General Attributes
                     ui.group(|ui| {
                         ui.set_width(ui.available_width());
                         ui.strong(if is_directory { "Directory Attributes" } else { "General Attributes" });
@@ -1205,14 +1236,15 @@ impl eframe::App for FileInspectorApp {
 
                     ui.add_space(10.0);
 
+                    // Custom Tags Management
                     ui.group(|ui| {
                         ui.set_width(ui.available_width());
                         ui.strong("Custom Tags Management");
                         ui.add_space(4.0);
 
                         ui.horizontal(|ui| {
-                            ui.label("Tags (comma separated):");
-                            ui.add(egui::TextEdit::singleline(&mut self.tag_input_buffer).desired_width(300.0));
+                            ui.label("Tags:");
+                            ui.add(egui::TextEdit::singleline(&mut self.tag_input_buffer).desired_width(260.0));
                             if ui.button("💾 Save Tags").clicked() {
                                 self.save_current_tags();
                             }
@@ -1234,6 +1266,7 @@ impl eframe::App for FileInspectorApp {
 
                     ui.add_space(10.0);
 
+                    // Parsed Format Metadata
                     if !extra_details.is_empty() {
                         ui.group(|ui| {
                             ui.set_width(ui.available_width());
@@ -1254,10 +1287,10 @@ impl eframe::App for FileInspectorApp {
                         });
                     }
                 } else {
-                    ui.add_space(40.0);
+                    ui.add_space(120.0);
                     ui.centered_and_justified(|ui| {
                         ui.label(
-                            egui::RichText::new("Drag & Drop a file or folder anywhere onto this window\nor click 'Browse...' to inspect.")
+                            egui::RichText::new("Drag & Drop a file or folder anywhere onto this window,\nor click 'Browse...' in the left panel to inspect.")
                                 .color(egui::Color32::GRAY)
                                 .italics(),
                         );

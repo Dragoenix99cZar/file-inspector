@@ -121,3 +121,4 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 - <img src="./screenshots/file-inspector_v3.png" alt="v3" width="480">
 - <img src="./screenshots/file-inspector_v4.png" alt="v4" width="480">
 - <img src="./screenshots/file-inspector_v5.png" alt="v5" width="480">
+- <img src="./screenshots/file-inspector_v6.png" alt="v6" width="480">
