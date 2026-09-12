@@ -138,6 +138,8 @@ struct FileMetadataInfo {
     extension: String,
     size_bytes: u64,
     file_type: String,
+    year: String,
+    month: String,
     created_at: String,
     modified_at: String,
     extra_details: Vec<(String, String)>,
@@ -255,6 +257,8 @@ impl FileInspectorApp {
                     extension TEXT NOT NULL,
                     size_bytes INTEGER NOT NULL,
                     file_type TEXT NOT NULL,
+                    year TEXT NOT NULL,
+                    month TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     modified_at TEXT NOT NULL,
                     extra_details TEXT NOT NULL,
@@ -292,8 +296,8 @@ impl FileInspectorApp {
             let extra_json = serde_json::to_string(&info.extra_details).unwrap_or_default();
             let tags_json = serde_json::to_string(&info.tags).unwrap_or_default();
             let _ = conn.execute(
-                "INSERT OR REPLACE INTO files (file_hash, path, name, extension, size_bytes, file_type, created_at, modified_at, extra_details, cached_at, is_directory, tags)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                "INSERT OR REPLACE INTO files (file_hash, path, name, extension, size_bytes, file_type, year, month, created_at, modified_at, extra_details, cached_at, is_directory, tags)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                 params![
                     info.file_hash,
                     info.path.to_string_lossy().to_string(),
@@ -301,6 +305,8 @@ impl FileInspectorApp {
                     info.extension,
                     info.size_bytes as i64,
                     info.file_type,
+                    info.year,
+                    info.month,
                     info.created_at,
                     info.modified_at,
                     extra_json,
@@ -315,7 +321,7 @@ impl FileInspectorApp {
     fn get_from_db(&self, hash: &str) -> Option<FileMetadataInfo> {
         let conn = Connection::open(&self.db_path).ok()?;
         let mut stmt = conn.prepare(
-            "SELECT path, name, extension, size_bytes, file_type, created_at, modified_at, extra_details, cached_at, is_directory, tags FROM files WHERE file_hash = ?",
+            "SELECT path, name, extension, size_bytes, file_type, year, month, created_at, modified_at, extra_details, cached_at, is_directory, tags FROM files WHERE file_hash = ?",
         ).ok()?;
 
         let mut rows = stmt
@@ -326,14 +332,16 @@ impl FileInspectorApp {
                     extension: row.get(2)?,
                     size_bytes: row.get::<_, i64>(3)? as u64,
                     file_type: row.get(4)?,
-                    created_at: row.get(5)?,
-                    modified_at: row.get(6)?,
-                    extra_details: serde_json::from_str(&row.get::<_, String>(7)?)
+                    year: row.get(5)?,
+                    month: row.get(6)?,
+                    created_at: row.get(7)?,
+                    modified_at: row.get(8)?,
+                    extra_details: serde_json::from_str(&row.get::<_, String>(9)?)
                         .unwrap_or_default(),
                     file_hash: hash.to_string(),
-                    cached_at: row.get(8)?,
-                    is_directory: row.get(9)?,
-                    tags: serde_json::from_str(&row.get::<_, String>(10)?).unwrap_or_default(),
+                    cached_at: row.get(10)?,
+                    is_directory: row.get(11)?,
+                    tags: serde_json::from_str(&row.get::<_, String>(12)?).unwrap_or_default(),
                 })
             })
             .ok()?;
@@ -342,10 +350,14 @@ impl FileInspectorApp {
     }
 
     fn fetch_all_from_db(&self) -> Vec<FileMetadataInfo> {
+        Self::fetch_all_from_db_with_conn(&self.db_path)
+    }
+
+    fn fetch_all_from_db_with_conn(db_path: &Path) -> Vec<FileMetadataInfo> {
         let mut list = Vec::new();
-        if let Ok(conn) = Connection::open(&self.db_path) {
+        if let Ok(conn) = Connection::open(db_path) {
             if let Ok(mut stmt) = conn.prepare(
-                "SELECT file_hash, path, name, extension, size_bytes, file_type, created_at, modified_at, extra_details, cached_at, is_directory, tags FROM files"
+                "SELECT file_hash, path, name, extension, size_bytes, file_type, year, month, created_at, modified_at, extra_details, cached_at, is_directory, tags FROM files"
             ) {
                 if let Ok(rows) = stmt.query_map([], |row| {
                     Ok(FileMetadataInfo {
@@ -355,12 +367,14 @@ impl FileInspectorApp {
                         extension: row.get(3)?,
                         size_bytes: row.get::<_, i64>(4)? as u64,
                         file_type: row.get(5)?,
-                        created_at: row.get(6)?,
-                        modified_at: row.get(7)?,
-                        extra_details: serde_json::from_str(&row.get::<_, String>(8)?).unwrap_or_default(),
-                        cached_at: row.get(9)?,
-                        is_directory: row.get(10)?,
-                        tags: serde_json::from_str(&row.get::<_, String>(11)?).unwrap_or_default(),
+                        year: row.get(6)?,
+                        month: row.get(7)?,
+                        created_at: row.get(8)?,
+                        modified_at: row.get(9)?,
+                        extra_details: serde_json::from_str(&row.get::<_, String>(10)?).unwrap_or_default(),
+                        cached_at: row.get(11)?,
+                        is_directory: row.get(12)?,
+                        tags: serde_json::from_str(&row.get::<_, String>(13)?).unwrap_or_default(),
                     })
                 }) {
                     for r in rows.flatten() {
@@ -393,102 +407,171 @@ impl FileInspectorApp {
         }
     }
 
-    fn parse_all_scanned(&mut self) {
-        let all_files = self.fetch_all_from_db();
-        let mut count = 0;
+    fn refresh_file_metadata(&self, file_info: &mut FileMetadataInfo) {
+        let path = file_info.path.clone();
+        let extension = file_info.extension.clone();
+        let name = file_info.name.clone();
 
-        for mut file_info in all_files {
-            if file_info.tags.iter().any(|t| t == "scanned") {
-                let path = file_info.path.clone();
-                let extension = file_info.extension.clone();
+        file_info.file_type = if extension.is_empty() {
+            "no-ext".to_string()
+        } else {
+            format!("{} file", extension).to_lowercase()
+        };
 
-                file_info.file_type = if extension.is_empty() {
-                    "unknown / binary".to_string()
-                } else {
-                    format!("{} file", extension).to_lowercase()
-                };
+        if let Ok(metadata) = fs::metadata(&path) {
+            if let Ok(modified_time) = metadata.modified() {
+                let datetime: chrono::DateTime<chrono::Local> = modified_time.into();
+                file_info.year = datetime.format("%Y").to_string().to_lowercase();
+                file_info.month = datetime.format("%B").to_string().to_lowercase();
+            } else {
+                file_info.year = "unknown".into();
+                file_info.month = "unknown".into();
+            }
+        } else {
+            file_info.year = "unknown".into();
+            file_info.month = "unknown".into();
+        }
 
-                let mut unique_tags: HashSet<String> = HashSet::new();
-                for tag in &file_info.tags {
-                    let cleaned = tag.trim().to_lowercase();
-                    if !cleaned.is_empty() && cleaned != "scanned" {
-                        unique_tags.insert(cleaned);
-                    }
+        let mut unique_tags: HashSet<String> = HashSet::new();
+        for tag in &file_info.tags {
+            let cleaned = tag.trim().to_lowercase();
+            // Avoid adding a standalone extension tag if it's already redundant with the file type
+            if !cleaned.is_empty() && cleaned != "scanned" {
+                if file_info.extension == cleaned && file_info.file_type.contains(&cleaned) {
+                    continue;
                 }
-
-                unique_tags.insert(file_info.file_type.clone());
-                unique_tags.insert("parsed".to_string());
-
-                if let Ok(metadata) = fs::metadata(&path) {
-                    if let Ok(modified_time) = metadata.modified() {
-                        let datetime: chrono::DateTime<chrono::Local> = modified_time.into();
-                        unique_tags.insert(datetime.format("%Y").to_string().to_lowercase());
-                        unique_tags.insert(datetime.format("%B").to_string().to_lowercase());
-                    }
-                }
-
-                let mut updated_tags: Vec<String> = unique_tags.into_iter().collect();
-                updated_tags.sort();
-                file_info.tags = updated_tags;
-
-                let mut extra_details = Vec::new();
-
-                if self.config.included_files.contains(&file_info.name) {
-                    extra_details.push((
-                        "Config Status".into(),
-                        "Explicitly Included Priority File".into(),
-                    ));
-                }
-
-                if self
-                    .config
-                    .search_criteria
-                    .image_extensions
-                    .contains(&extension)
-                {
-                    if let Ok(dims) = image::image_dimensions(&path) {
-                        extra_details.push(("Width".into(), format!("{} px", dims.0)));
-                        extra_details.push(("Height".into(), format!("{} px", dims.1)));
-                        extra_details.push((
-                            "Aspect Ratio".into(),
-                            format!("{:.2}", dims.0 as f32 / dims.1 as f32),
-                        ));
-                    }
-                }
-
-                if self
-                    .config
-                    .search_criteria
-                    .media_extensions
-                    .contains(&extension)
-                {
-                    extra_details.extend(get_media_info_via_ffprobe(&path));
-                }
-
-                if self
-                    .config
-                    .search_criteria
-                    .text_extensions
-                    .contains(&extension)
-                {
-                    if let Ok(text_stats) =
-                        analyze_text_file(&path, &extension, &self.config.language_extensions)
-                    {
-                        extra_details.push(("Language Type".into(), text_stats.language));
-                        extra_details
-                            .push(("Lines of Code (LOC)".into(), text_stats.loc.to_string()));
-                        extra_details
-                            .push(("Total Characters".into(), text_stats.chars.to_string()));
-                    }
-                }
-
-                file_info.extra_details = extra_details;
-                self.save_to_db(&file_info);
-                count += 1;
+                unique_tags.insert(cleaned);
             }
         }
 
-        self.status_message = format!("Successfully parsed {} scanned files.", count);
+        unique_tags.insert(file_info.file_type.clone());
+        unique_tags.insert("parsed".to_string());
+        unique_tags.insert(file_info.month.clone());
+        unique_tags.insert(file_info.year.clone());
+
+        let mut updated_tags: Vec<String> = unique_tags.into_iter().collect();
+        updated_tags.sort();
+        file_info.tags = updated_tags;
+
+        let mut extra_details = Vec::new();
+
+        if self.config.included_files.contains(&name) {
+            extra_details.push((
+                "Config Status".into(),
+                "Explicitly Included Priority File".into(),
+            ));
+        }
+
+        if self
+            .config
+            .search_criteria
+            .image_extensions
+            .contains(&extension)
+        {
+            if let Ok(dims) = image::image_dimensions(&path) {
+                extra_details.push(("Width".into(), format!("{} px", dims.0)));
+                extra_details.push(("Height".into(), format!("{} px", dims.1)));
+                extra_details.push((
+                    "Aspect Ratio".into(),
+                    format!("{:.2}", dims.0 as f32 / dims.1 as f32),
+                ));
+            }
+        }
+
+        if self
+            .config
+            .search_criteria
+            .media_extensions
+            .contains(&extension)
+        {
+            extra_details.extend(get_media_info_via_ffprobe(&path));
+        }
+
+        if self
+            .config
+            .search_criteria
+            .text_extensions
+            .contains(&extension)
+        {
+            if let Ok(text_stats) =
+                analyze_text_file(&path, &extension, &self.config.language_extensions)
+            {
+                extra_details.push(("Language Type".into(), text_stats.language));
+                extra_details.push(("Lines of Code (LOC)".into(), text_stats.loc.to_string()));
+                extra_details.push(("Total Characters".into(), text_stats.chars.to_string()));
+            }
+        }
+
+        file_info.extra_details = extra_details;
+    }
+
+    fn parse_all_scanned(&mut self) {
+        let all_files = Self::fetch_all_from_db_with_conn(&self.db_path);
+        let mut count = 0;
+
+        let mut conn = match Connection::open(&self.db_path) {
+            Ok(c) => c,
+            Err(_) => {
+                self.status_message = "Failed to open database for parsing.".to_string();
+                return;
+            }
+        };
+
+        let tx = match conn.transaction() {
+            Ok(t) => t,
+            Err(_) => {
+                self.status_message = "Failed to begin database transaction.".to_string();
+                return;
+            }
+        };
+
+        {
+            let mut stmt = match tx.prepare(
+                "INSERT OR REPLACE INTO files (file_hash, path, name, extension, size_bytes, file_type, year, month, created_at, modified_at, extra_details, cached_at, is_directory, tags)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)"
+            ) {
+                Ok(s) => s,
+                Err(_) => {
+                    self.status_message = "Failed to prepare statement for parsing.".to_string();
+                    return;
+                }
+            };
+
+            for mut file_info in all_files {
+                if file_info.tags.iter().any(|t| t == "scanned") {
+                    self.refresh_file_metadata(&mut file_info);
+
+                    let extra_json =
+                        serde_json::to_string(&file_info.extra_details).unwrap_or_default();
+                    let tags_json = serde_json::to_string(&file_info.tags).unwrap_or_default();
+
+                    let _ = stmt.execute(params![
+                        file_info.file_hash,
+                        file_info.path.to_string_lossy().to_string(),
+                        file_info.name,
+                        file_info.extension,
+                        file_info.size_bytes as i64,
+                        file_info.file_type,
+                        file_info.year,
+                        file_info.month,
+                        file_info.created_at,
+                        file_info.modified_at,
+                        extra_json,
+                        file_info.cached_at,
+                        file_info.is_directory,
+                        tags_json
+                    ]);
+
+                    count += 1;
+                }
+            }
+        }
+
+        if tx.commit().is_ok() {
+            self.status_message = format!("Successfully parsed {} scanned files.", count);
+        } else {
+            self.status_message = "Failed to commit parsed files transaction.".to_string();
+        }
 
         if let Some(curr) = &self.current_file {
             let h = curr.file_hash.clone();
@@ -558,6 +641,8 @@ impl FileInspectorApp {
                 extension: "".into(),
                 size_bytes: 0,
                 file_type: "directory".into(),
+                year: "unknown".into(),
+                month: "unknown".into(),
                 created_at,
                 modified_at,
                 extra_details: vec![("Status".into(), "Indexing in background...".into())],
@@ -599,17 +684,27 @@ impl FileInspectorApp {
             .to_lowercase();
         let size_bytes = metadata.len();
         let file_type = if extension.is_empty() {
-            "unknown / binary".to_string()
+            "no-ext".to_string()
         } else {
             format!("{} file", extension).to_lowercase()
         };
 
-        let mut initial_tags = vec![file_type.clone(), "parsed".to_string()];
-        if let Ok(modified_time) = metadata.modified() {
+        let (year, month) = if let Ok(modified_time) = metadata.modified() {
             let datetime: chrono::DateTime<chrono::Local> = modified_time.into();
-            initial_tags.push(datetime.format("%Y").to_string().to_lowercase());
-            initial_tags.push(datetime.format("%B").to_string().to_lowercase());
-        }
+            (
+                datetime.format("%Y").to_string().to_lowercase(),
+                datetime.format("%B").to_string().to_lowercase(),
+            )
+        } else {
+            ("unknown".into(), "unknown".into())
+        };
+
+        let initial_tags = vec![
+            file_type.clone(),
+            "parsed".to_string(),
+            month.clone(),
+            year.clone(),
+        ];
 
         let created_at = metadata
             .created()
@@ -675,6 +770,8 @@ impl FileInspectorApp {
             extension,
             size_bytes,
             file_type,
+            year,
+            month,
             created_at,
             modified_at,
             extra_details,
@@ -715,100 +812,19 @@ impl FileInspectorApp {
     }
 
     fn update_current_file_metadata(&mut self) {
-        if let Some(file_info) = &mut self.current_file {
+        if let Some(mut file_info) = self.current_file.take() {
             if file_info.is_directory {
                 self.status_message =
                     "Metadata updates are currently only supported for files.".to_string();
+                self.current_file = Some(file_info);
                 return;
             }
 
-            let path = file_info.path.clone();
-            let extension = file_info.extension.clone();
-
-            file_info.file_type = if extension.is_empty() {
-                "unknown / binary".to_string()
-            } else {
-                format!("{} file", extension).to_lowercase()
-            };
-
-            let mut unique_tags: HashSet<String> = HashSet::new();
-
-            for tag in &file_info.tags {
-                let cleaned = tag.trim().to_lowercase();
-                if !cleaned.is_empty() {
-                    unique_tags.insert(cleaned);
-                }
-            }
-
-            unique_tags.insert(file_info.file_type.clone());
-            unique_tags.insert("parsed".to_string());
-
-            if let Ok(metadata) = fs::metadata(&path) {
-                if let Ok(modified_time) = metadata.modified() {
-                    let datetime: chrono::DateTime<chrono::Local> = modified_time.into();
-                    unique_tags.insert(datetime.format("%Y").to_string().to_lowercase());
-                    unique_tags.insert(datetime.format("%B").to_string().to_lowercase());
-                }
-            }
-
-            let mut updated_tags: Vec<String> = unique_tags.into_iter().collect();
-            updated_tags.sort();
-            file_info.tags = updated_tags;
-
+            self.refresh_file_metadata(&mut file_info);
             self.tag_input_buffer = file_info.tags.join(", ");
 
-            let mut extra_details = Vec::new();
-
-            if self.config.included_files.contains(&file_info.name) {
-                extra_details.push((
-                    "Config Status".into(),
-                    "Explicitly Included Priority File".into(),
-                ));
-            }
-
-            if self
-                .config
-                .search_criteria
-                .image_extensions
-                .contains(&extension)
-            {
-                if let Ok(dims) = image::image_dimensions(&path) {
-                    extra_details.push(("Width".into(), format!("{} px", dims.0)));
-                    extra_details.push(("Height".into(), format!("{} px", dims.1)));
-                    extra_details.push((
-                        "Aspect Ratio".into(),
-                        format!("{:.2}", dims.0 as f32 / dims.1 as f32),
-                    ));
-                }
-            }
-
-            if self
-                .config
-                .search_criteria
-                .media_extensions
-                .contains(&extension)
-            {
-                extra_details.extend(get_media_info_via_ffprobe(&path));
-            }
-
-            if self
-                .config
-                .search_criteria
-                .text_extensions
-                .contains(&extension)
-            {
-                if let Ok(text_stats) =
-                    analyze_text_file(&path, &extension, &self.config.language_extensions)
-                {
-                    extra_details.push(("Language Type".into(), text_stats.language));
-                    extra_details.push(("Lines of Code (LOC)".into(), text_stats.loc.to_string()));
-                    extra_details.push(("Total Characters".into(), text_stats.chars.to_string()));
-                }
-            }
-
-            file_info.extra_details = extra_details;
-            let info_clone = file_info.clone();
-            self.save_to_db(&info_clone);
+            self.save_to_db(&file_info);
+            self.current_file = Some(file_info);
             self.status_message =
                 "Metadata re-extracted and updated in SQLite database successfully!".to_string();
         }
@@ -913,18 +929,28 @@ fn index_directory_recursive(
                         if !already_exists {
                             let size_bytes = metadata.len();
                             let file_type = if extension.is_empty() {
-                                "unknown / binary".to_string()
+                                "no-ext".to_string()
                             } else {
                                 format!("{} file", extension).to_lowercase()
                             };
 
-                            let mut initial_tags = vec![file_type.clone(), "scanned".to_string()];
-                            if let Ok(modified_time) = metadata.modified() {
+                            let (year, month) = if let Ok(modified_time) = metadata.modified() {
                                 let datetime: chrono::DateTime<chrono::Local> =
                                     modified_time.into();
-                                initial_tags.push(datetime.format("%Y").to_string().to_lowercase());
-                                initial_tags.push(datetime.format("%B").to_string().to_lowercase());
-                            }
+                                (
+                                    datetime.format("%Y").to_string().to_lowercase(),
+                                    datetime.format("%B").to_string().to_lowercase(),
+                                )
+                            } else {
+                                ("unknown".into(), "unknown".into())
+                            };
+
+                            let initial_tags = vec![
+                                file_type.clone(),
+                                "scanned".to_string(),
+                                month.clone(),
+                                year.clone(),
+                            ];
 
                             let created_at = metadata
                                 .created()
@@ -949,6 +975,8 @@ fn index_directory_recursive(
                                 extension,
                                 size_bytes,
                                 file_type,
+                                year,
+                                month,
                                 created_at,
                                 modified_at,
                                 extra_details,
@@ -964,8 +992,8 @@ fn index_directory_recursive(
                                 let tags_json =
                                     serde_json::to_string(&file_info.tags).unwrap_or_default();
                                 let _ = c.execute(
-                                    "INSERT OR REPLACE INTO files (file_hash, path, name, extension, size_bytes, file_type, created_at, modified_at, extra_details, cached_at, is_directory, tags)
-                                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                                    "INSERT OR REPLACE INTO files (file_hash, path, name, extension, size_bytes, file_type, year, month, created_at, modified_at, extra_details, cached_at, is_directory, tags)
+                                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                                     params![
                                         file_info.file_hash,
                                         file_info.path.to_string_lossy().to_string(),
@@ -973,6 +1001,8 @@ fn index_directory_recursive(
                                         file_info.extension,
                                         file_info.size_bytes as i64,
                                         file_info.file_type,
+                                        file_info.year,
+                                        file_info.month,
                                         file_info.created_at,
                                         file_info.modified_at,
                                         extra_json,
@@ -1290,7 +1320,9 @@ impl eframe::App for FileInspectorApp {
                             let tag_match =
                                 info.tags.iter().any(|t| t.to_lowercase().contains(term));
                             let ext_match = info.extension.to_lowercase() == term;
-                            name_match || tag_match || ext_match
+                            let year_match = info.year.to_lowercase() == term;
+                            let month_match = info.month.to_lowercase() == term;
+                            name_match || tag_match || ext_match || year_match || month_match
                         };
 
                         if !terms.is_empty() && !terms.iter().any(|t| matches_term(t)) {
@@ -1358,6 +1390,9 @@ impl eframe::App for FileInspectorApp {
                     let path_str = file_info.path.to_string_lossy().to_string();
                     let file_hash = file_info.file_hash.clone();
                     let file_type = file_info.file_type.clone();
+                    let year = file_info.year.clone();
+                    let month = file_info.month.clone();
+                    let extension = file_info.extension.clone();
                     let size_bytes = file_info.size_bytes;
                     let created_at = file_info.created_at.clone();
                     let modified_at = file_info.modified_at.clone();
@@ -1398,6 +1433,18 @@ impl eframe::App for FileInspectorApp {
                                 ui.end_row();
 
                                 if !is_directory {
+                                    ui.label("Year");
+                                    ui.label(&year);
+                                    ui.end_row();
+
+                                    ui.label("Month");
+                                    ui.label(&month);
+                                    ui.end_row();
+
+                                    ui.label("Extension");
+                                    ui.label(&extension);
+                                    ui.end_row();
+
                                     ui.label("Size");
                                     ui.label(format!("{} ({} bytes)", format_file_size(size_bytes), size_bytes));
                                     ui.end_row();
