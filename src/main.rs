@@ -6,6 +6,7 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::SystemTime;
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -143,6 +144,16 @@ struct FileMetadataInfo {
     tags: Vec<String>,
 }
 
+enum IndexProgress {
+    Progress(String),
+    Finished {
+        total_files: usize,
+        indexed_files: usize,
+        unindexed_types: HashMap<String, usize>,
+        unknown_types: HashMap<String, usize>,
+    },
+}
+
 struct FileInspectorApp {
     current_file: Option<FileMetadataInfo>,
     status_message: String,
@@ -151,6 +162,9 @@ struct FileInspectorApp {
     config: AppConfig,
     tag_input_buffer: String,
     search_query: String,
+    is_indexing: bool,
+    indexing_rx: Option<Receiver<IndexProgress>>,
+    current_indexing_file: String,
 }
 
 impl Default for FileInspectorApp {
@@ -177,6 +191,9 @@ impl Default for FileInspectorApp {
             config,
             tag_input_buffer: String::new(),
             search_query: String::new(),
+            is_indexing: false,
+            indexing_rx: None,
+            current_indexing_file: String::new(),
         };
 
         app.init_db();
@@ -395,37 +412,26 @@ impl FileInspectorApp {
                 .map(format_system_time)
                 .unwrap_or_else(|_| "Unavailable".to_string());
 
-            let (total_files, indexed_files, unindexed_types, unknown_types) =
-                index_directory_recursive(&path, &self.config, &self.db_path);
+            let path_clone = path.clone();
+            let config_clone = self.config.clone();
+            let db_path_clone = self.db_path.clone();
 
-            let mut extra_details = Vec::new();
-            extra_details.push(("Total Files Encountered".into(), total_files.to_string()));
-            extra_details.push((
-                "Successfully Indexed Files".into(),
-                indexed_files.to_string(),
-            ));
+            let (tx, rx) = mpsc::channel();
+            self.is_indexing = true;
+            self.indexing_rx = Some(rx);
+            self.status_message = format!("Indexing directory: {}", path.display());
 
-            let unindexed_summary = if unindexed_types.is_empty() {
-                "None".into()
-            } else {
-                unindexed_types
-                    .iter()
-                    .map(|(k, v)| format!("{}: {}", k, v))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            };
-            extra_details.push(("Un-indexed Files / Types".into(), unindexed_summary));
+            std::thread::spawn(move || {
+                let (total_files, indexed_files, unindexed_types, unknown_types) =
+                    index_directory_recursive(&path_clone, &config_clone, &db_path_clone, &tx);
 
-            let unknown_summary = if unknown_types.is_empty() {
-                "None".into()
-            } else {
-                unknown_types
-                    .iter()
-                    .map(|(k, v)| format!("{}: {}", k, v))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            };
-            extra_details.push(("Unknown File Types".into(), unknown_summary));
+                let _ = tx.send(IndexProgress::Finished {
+                    total_files,
+                    indexed_files,
+                    unindexed_types,
+                    unknown_types,
+                });
+            });
 
             let dir_info = FileMetadataInfo {
                 path: path.clone(),
@@ -435,7 +441,7 @@ impl FileInspectorApp {
                 file_type: "Directory".into(),
                 created_at,
                 modified_at,
-                extra_details,
+                extra_details: vec![("Status".into(), "Indexing in background...".into())],
                 file_hash: format!("dir_{}", path.to_string_lossy()),
                 cached_at: format_system_time(SystemTime::now()),
                 is_directory: true,
@@ -444,8 +450,6 @@ impl FileInspectorApp {
 
             self.tag_input_buffer = dir_info.tags.join(", ");
             self.current_file = Some(dir_info);
-            self.status_message =
-                "Directory recursively indexed into SQLite successfully.".to_string();
             return;
         }
 
@@ -659,6 +663,7 @@ fn index_directory_recursive(
     dir_path: &Path,
     config: &AppConfig,
     db_path: &Path,
+    tx: &Sender<IndexProgress>,
 ) -> (usize, usize, HashMap<String, usize>, HashMap<String, usize>) {
     let mut total_files = 0;
     let mut indexed_files = 0;
@@ -677,7 +682,7 @@ fn index_directory_recursive(
                     continue;
                 }
                 let (sub_total, sub_indexed, sub_unindexed, sub_unknown) =
-                    index_directory_recursive(&entry_path, config, db_path);
+                    index_directory_recursive(&entry_path, config, db_path, tx);
                 total_files += sub_total;
                 indexed_files += sub_indexed;
                 for (k, v) in sub_unindexed {
@@ -688,6 +693,7 @@ fn index_directory_recursive(
                 }
             } else if entry_path.is_file() {
                 total_files += 1;
+                let _ = tx.send(IndexProgress::Progress(file_name.clone()));
 
                 if config.excluded_files.contains(&file_name) {
                     *unindexed_types.entry("Excluded File".into()).or_insert(0) += 1;
@@ -934,6 +940,64 @@ fn format_file_size(bytes: u64) -> String {
 impl eframe::App for FileInspectorApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.set_pixels_per_point(1.7);
+
+        if let Some(rx) = &self.indexing_rx {
+            match rx.try_recv() {
+                Ok(IndexProgress::Progress(filename)) => {
+                    self.current_indexing_file = filename;
+                    ctx.request_repaint();
+                }
+                Ok(IndexProgress::Finished {
+                    total_files,
+                    indexed_files,
+                    unindexed_types,
+                    unknown_types,
+                }) => {
+                    self.is_indexing = false;
+                    self.indexing_rx = None;
+                    self.status_message = format!(
+                        "Indexed {}/{} files successfully into SQLite.",
+                        indexed_files, total_files
+                    );
+
+                    if let Some(file_info) = &mut self.current_file {
+                        let mut extra_details = Vec::new();
+                        extra_details
+                            .push(("Total Files Encountered".into(), total_files.to_string()));
+                        extra_details.push((
+                            "Successfully Indexed Files".into(),
+                            indexed_files.to_string(),
+                        ));
+
+                        let unindexed_summary = if unindexed_types.is_empty() {
+                            "None".into()
+                        } else {
+                            unindexed_types
+                                .iter()
+                                .map(|(k, v)| format!("{}: {}", k, v))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        };
+                        extra_details.push(("Un-indexed Files / Types".into(), unindexed_summary));
+
+                        let unknown_summary = if unknown_types.is_empty() {
+                            "None".into()
+                        } else {
+                            unknown_types
+                                .iter()
+                                .map(|(k, v)| format!("{}: {}", k, v))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        };
+                        extra_details.push(("Unknown File Types".into(), unknown_summary));
+                        file_info.extra_details = extra_details;
+                    }
+                    ctx.request_repaint();
+                }
+                Err(_) => {}
+            }
+        }
+
         ctx.input(|i| {
             if !i.raw.dropped_files.is_empty() {
                 if let Some(file) = i.raw.dropped_files.first() {
@@ -965,6 +1029,19 @@ impl eframe::App for FileInspectorApp {
                 ui.label(&self.status_message);
             });
 
+            if self.is_indexing {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Processing: {}",
+                            self.current_indexing_file
+                        ))
+                        .color(egui::Color32::CYAN),
+                    );
+                });
+            }
+
             ui.add_space(6.0);
 
             ui.horizontal(|ui| {
@@ -991,7 +1068,6 @@ impl eframe::App for FileInspectorApp {
                             if terms.is_empty() {
                                 return false;
                             }
-                            // Match if ALL terms or ANY term match? Usually multi-search implies checking if queries match text/tags. Let's do ANY term matches filename or tags for flexible search, or match all terms. Let's make it match if *any* term is found in name or tags, or refine as needed. Let's match if all terms are satisfied or any term. Let's do: matches if query terms match name or tags.
                             terms.iter().any(|term| {
                                 let name_match = info.name.to_lowercase().contains(term);
                                 let tag_match = info.tags.iter().any(|t| t.to_lowercase().contains(term));
@@ -1099,14 +1175,14 @@ impl eframe::App for FileInspectorApp {
 
                         ui.horizontal(|ui| {
                             ui.label("Tags (comma separated):");
-                                ui.add(egui::TextEdit::singleline(&mut self.tag_input_buffer).desired_width(300.0));
-                                if ui.button("💾 Save Tags").clicked() {
-                                    self.save_current_tags();
-                                }
-                                if ui.button("🔄 Update Metadata").clicked() {
-                                    self.update_current_file_metadata();
-                                }
-                            });
+                            ui.add(egui::TextEdit::singleline(&mut self.tag_input_buffer).desired_width(300.0));
+                            if ui.button("💾 Save Tags").clicked() {
+                                self.save_current_tags();
+                            }
+                            if ui.button("🔄 Update Metadata").clicked() {
+                                self.update_current_file_metadata();
+                            }
+                        });
 
                         if !tags.is_empty() {
                             ui.add_space(4.0);
