@@ -444,13 +444,20 @@ impl FileInspectorApp {
             }
         }
 
-        unique_tags.insert(file_info.file_type.clone());
-        unique_tags.insert("parsed".to_string());
-        unique_tags.insert(file_info.month.clone());
-        unique_tags.insert(file_info.year.clone());
+        // Remove core tags from unique_tags to prevent duplication in other-tags
+        unique_tags.remove(&file_info.file_type);
+        unique_tags.remove(&file_info.year);
+        unique_tags.remove(&file_info.month);
 
-        let mut updated_tags: Vec<String> = unique_tags.into_iter().collect();
-        updated_tags.sort();
+        let mut updated_tags = Vec::new();
+        updated_tags.push(file_info.file_type.clone());
+        updated_tags.push(file_info.year.clone());
+        updated_tags.push(file_info.month.clone());
+
+        let mut other_tags: Vec<String> = unique_tags.into_iter().collect();
+        other_tags.sort();
+        updated_tags.extend(other_tags);
+
         file_info.tags = updated_tags;
 
         let mut extra_details = Vec::new();
@@ -1201,6 +1208,23 @@ impl eframe::App for FileInspectorApp {
                                 .join(", ")
                         };
                         extra_details.push(("Unknown File Types".into(), unknown_summary));
+
+                        // Aggregate tag counts across all indexed files in the database[cite: 5]
+                        let all_files = Self::fetch_all_from_db_with_conn(&self.db_path);
+                        let mut tag_counts: HashMap<String, usize> = HashMap::new();
+                        for file in &all_files {
+                            for tag in &file.tags {
+                                *tag_counts.entry(tag.clone()).or_insert(0) += 1;
+                            }
+                        }
+
+                        let mut sorted_tags: Vec<_> = tag_counts.into_iter().collect();
+                        sorted_tags.sort_by(|a, b| a.0.cmp(&b.0));
+
+                        for (tag, count) in sorted_tags {
+                            extra_details.push((tag, format!("{} files", count)));
+                        }
+
                         file_info.extra_details = extra_details;
                     }
                     ctx.request_repaint();
