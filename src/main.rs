@@ -447,14 +447,14 @@ impl FileInspectorApp {
                 name,
                 extension: "".into(),
                 size_bytes: 0,
-                file_type: "Directory".into(),
+                file_type: "directory".into(),
                 created_at,
                 modified_at,
                 extra_details: vec![("Status".into(), "Indexing in background...".into())],
                 file_hash: format!("dir_{}", path.to_string_lossy()),
                 cached_at: format_system_time(SystemTime::now()),
                 is_directory: true,
-                tags: vec!["Directory".into()],
+                tags: vec!["directory".into()],
             };
 
             self.tag_input_buffer = dir_info.tags.join(", ");
@@ -470,7 +470,11 @@ impl FileInspectorApp {
             }
         };
 
-        if let Some(cached_info) = self.get_from_db(&file_hash) {
+        if let Some(mut cached_info) = self.get_from_db(&file_hash) {
+            if let Some(pos) = cached_info.tags.iter().position(|t| t == "scanned") {
+                cached_info.tags[pos] = "parsed".to_string();
+                self.save_to_db(&cached_info);
+            }
             self.tag_input_buffer = cached_info.tags.join(", ");
             self.current_file = Some(cached_info);
             self.status_message = "Loaded file details instantly from SQLite database.".to_string();
@@ -485,16 +489,16 @@ impl FileInspectorApp {
             .to_lowercase();
         let size_bytes = metadata.len();
         let file_type = if extension.is_empty() {
-            "Unknown / Binary".to_string()
+            "unknown / binary".to_string()
         } else {
-            format!("{} file", extension.to_uppercase())
+            format!("{} file", extension).to_lowercase()
         };
 
-        let mut initial_tags = vec![file_type.clone()];
+        let mut initial_tags = vec![file_type.clone(), "parsed".to_string()];
         if let Ok(modified_time) = metadata.modified() {
             let datetime: chrono::DateTime<chrono::Local> = modified_time.into();
-            initial_tags.push(datetime.format("%Y").to_string());
-            initial_tags.push(datetime.format("%B").to_string());
+            initial_tags.push(datetime.format("%Y").to_string().to_lowercase());
+            initial_tags.push(datetime.format("%B").to_string().to_lowercase());
         }
 
         let created_at = metadata
@@ -581,7 +585,7 @@ impl FileInspectorApp {
             let parsed_tags: Vec<String> = self
                 .tag_input_buffer
                 .split(',')
-                .map(|s| s.trim().to_string())
+                .map(|s| s.trim().to_lowercase())
                 .filter(|s| !s.is_empty())
                 .collect();
 
@@ -610,6 +614,23 @@ impl FileInspectorApp {
 
             let path = file_info.path.clone();
             let extension = file_info.extension.clone();
+
+            let file_type = if extension.is_empty() {
+                "unknown / binary".to_string()
+            } else {
+                format!("{} file", extension).to_lowercase()
+            };
+            file_info.file_type = file_type;
+
+            for tag in &mut file_info.tags {
+                *tag = tag.to_lowercase();
+            }
+            if let Some(pos) = file_info.tags.iter().position(|t| t == "scanned") {
+                file_info.tags[pos] = "parsed".to_string();
+            } else if !file_info.tags.contains(&"parsed".to_string()) {
+                file_info.tags.push("parsed".to_string());
+            }
+
             let mut extra_details = Vec::new();
 
             if self.config.included_files.contains(&file_info.name) {
@@ -762,17 +783,17 @@ fn index_directory_recursive(
                         if !already_exists {
                             let size_bytes = metadata.len();
                             let file_type = if extension.is_empty() {
-                                "Unknown / Binary".to_string()
+                                "unknown / binary".to_string()
                             } else {
-                                format!("{} file", extension.to_uppercase())
+                                format!("{} file", extension).to_lowercase()
                             };
 
-                            let mut initial_tags = vec![file_type.clone()];
+                            let mut initial_tags = vec![file_type.clone(), "scanned".to_string()];
                             if let Ok(modified_time) = metadata.modified() {
                                 let datetime: chrono::DateTime<chrono::Local> =
                                     modified_time.into();
-                                initial_tags.push(datetime.format("%Y").to_string());
-                                initial_tags.push(datetime.format("%B").to_string());
+                                initial_tags.push(datetime.format("%Y").to_string().to_lowercase());
+                                initial_tags.push(datetime.format("%B").to_string().to_lowercase());
                             }
 
                             let created_at = metadata
@@ -976,6 +997,18 @@ fn format_file_size(bytes: u64) -> String {
     }
 }
 
+fn open_containing_folder(path: &str) {
+    #[cfg(target_os = "windows")]
+    {
+        let target = path.trim_start_matches(r"\\?\").to_string();
+
+        let _ = std::process::Command::new("explorer")
+            .arg("/select,")
+            .arg(&target)
+            .spawn();
+    }
+}
+
 impl eframe::App for FileInspectorApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.set_pixels_per_point(1.7);
@@ -1049,7 +1082,7 @@ impl eframe::App for FileInspectorApp {
             }
         });
 
-        // 1. LEFT PANEL: Search Results & Query Controls
+        // 1. RIGHT PANEL: Search Results & Query Controls
         egui::SidePanel::right("search_results_panel")
             .default_width(360.0)
             .resizable(true)
@@ -1111,7 +1144,7 @@ impl eframe::App for FileInspectorApp {
                     .iter()
                     .filter(|info| {
                         if terms.is_empty() {
-                            return true; // Show all if search query is empty
+                            return true;
                         }
                         terms.iter().any(|term| {
                             let name_match = info.name.to_lowercase().contains(term);
@@ -1141,18 +1174,17 @@ impl eframe::App for FileInspectorApp {
                         );
                     } else {
                         for file_info in matches {
-                            // Check if this file is currently inspected
                             let is_selected = self
                                 .current_file
                                 .as_ref()
                                 .map_or(false, |curr| curr.file_hash == file_info.file_hash);
 
                             ui.horizontal(|ui| {
+                                // File Select
                                 if ui.button("👆").clicked() {
                                     let path = file_info.path.clone();
                                     self.inspect_path(path);
                                 }
-                                // Truncate name to 15 characters and display format/tags details
                                 let short_name = Self::truncate_name(&file_info.name, 15);
                                 let display_str = format!(
                                     "{} [{}, {}]",
@@ -1161,7 +1193,6 @@ impl eframe::App for FileInspectorApp {
                                     file_info.tags.join(", ")
                                 );
 
-                                // Style the text differently if selected
                                 let mut text = egui::RichText::new(display_str);
                                 if is_selected {
                                     text = text.color(egui::Color32::LIGHT_BLUE).strong();
@@ -1189,7 +1220,6 @@ impl eframe::App for FileInspectorApp {
                     let tags = file_info.tags.clone();
                     let extra_details = file_info.extra_details.clone();
 
-                    // General Attributes
                     ui.group(|ui| {
                         ui.set_width(ui.available_width());
                         ui.strong(if is_directory { "Directory Attributes" } else { "General Attributes" });
@@ -1205,7 +1235,12 @@ impl eframe::App for FileInspectorApp {
                                 ui.end_row();
 
                                 ui.label("Full Path");
-                                ui.add(egui::Label::new(path_str).wrap().sense(egui::Sense::hover()));
+                                ui.horizontal(|ui| {
+                                    if ui.button("🔍").clicked() {
+                                        open_containing_folder(&path_str);
+                                    }
+                                    ui.add(egui::Label::new(path_str).wrap().sense(egui::Sense::hover()));
+                                });
                                 ui.end_row();
 
                                 if !is_directory {
@@ -1236,7 +1271,6 @@ impl eframe::App for FileInspectorApp {
 
                     ui.add_space(10.0);
 
-                    // Custom Tags Management
                     ui.group(|ui| {
                         ui.set_width(ui.available_width());
                         ui.strong("Custom Tags Management");
@@ -1266,7 +1300,6 @@ impl eframe::App for FileInspectorApp {
 
                     ui.add_space(10.0);
 
-                    // Parsed Format Metadata
                     if !extra_details.is_empty() {
                         ui.group(|ui| {
                             ui.set_width(ui.available_width());
