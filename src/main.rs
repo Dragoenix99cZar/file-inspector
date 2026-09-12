@@ -9,6 +9,13 @@ use std::process::Command;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::SystemTime;
 
+// ============================================================================
+// Constants & Configuration Types
+// ============================================================================
+
+const WIDTH: f32 = 1100.0;
+const HEIGHT: f32 = 780.0;
+
 #[derive(Clone, Serialize, Deserialize)]
 struct SearchCriteria {
     image_extensions: Vec<String>,
@@ -120,23 +127,9 @@ impl Default for AppConfig {
     }
 }
 
-const WIDTH: f32 = 1100.0;
-const HEIGHT: f32 = 780.0;
-
-fn main() -> Result<(), eframe::Error> {
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([WIDTH, HEIGHT])
-            .with_drag_and_drop(true),
-        ..Default::default()
-    };
-
-    eframe::run_native(
-        "Advanced File Inspector",
-        options,
-        Box::new(|_cc| Ok(Box::new(FileInspectorApp::default()))),
-    )
-}
+// ============================================================================
+// Metadata & Indexing Structures
+// ============================================================================
 
 #[derive(Clone, Serialize, Deserialize)]
 struct FileMetadataInfo {
@@ -163,6 +156,36 @@ enum IndexProgress {
         unknown_types: HashMap<String, usize>,
     },
 }
+
+struct TextStats {
+    language: String,
+    loc: usize,
+    chars: usize,
+}
+
+#[derive(Deserialize)]
+struct FFProbeOutput {
+    streams: Option<Vec<Stream>>,
+    format: Option<Format>,
+}
+
+#[derive(Deserialize)]
+struct Stream {
+    codec_type: String,
+    codec_name: Option<String>,
+    width: Option<u32>,
+    height: Option<u32>,
+}
+
+#[derive(Deserialize)]
+struct Format {
+    duration: Option<String>,
+    bit_rate: Option<String>,
+}
+
+// ============================================================================
+// Main Application State
+// ============================================================================
 
 struct FileInspectorApp {
     current_file: Option<FileMetadataInfo>,
@@ -212,6 +235,10 @@ impl Default for FileInspectorApp {
         app
     }
 }
+
+// ============================================================================
+// App Implementation & Database Operations
+// ============================================================================
 
 impl FileInspectorApp {
     fn init_db(&self) {
@@ -283,39 +310,26 @@ impl FileInspectorApp {
 
     fn get_from_db(&self, hash: &str) -> Option<FileMetadataInfo> {
         let conn = Connection::open(&self.db_path).ok()?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT path, name, extension, size_bytes, file_type, created_at, modified_at, extra_details, cached_at, is_directory, tags FROM files WHERE file_hash = ?",
-            )
-            .ok()?;
+        let mut stmt = conn.prepare(
+            "SELECT path, name, extension, size_bytes, file_type, created_at, modified_at, extra_details, cached_at, is_directory, tags FROM files WHERE file_hash = ?",
+        ).ok()?;
 
         let mut rows = stmt
             .query_map(params![hash], |row| {
-                let path_str: String = row.get(0)?;
-                let name: String = row.get(1)?;
-                let extension: String = row.get(2)?;
-                let size_bytes: i64 = row.get(3)?;
-                let file_type: String = row.get(4)?;
-                let created_at: String = row.get(5)?;
-                let modified_at: String = row.get(6)?;
-                let extra_json: String = row.get(7)?;
-                let cached_at: String = row.get(8)?;
-                let is_directory: bool = row.get(9)?;
-                let tags_json: String = row.get(10)?;
-
                 Ok(FileMetadataInfo {
-                    path: PathBuf::from(path_str),
-                    name,
-                    extension,
-                    size_bytes: size_bytes as u64,
-                    file_type,
-                    created_at,
-                    modified_at,
-                    extra_details: serde_json::from_str(&extra_json).unwrap_or_default(),
+                    path: PathBuf::from(row.get::<_, String>(0)?),
+                    name: row.get(1)?,
+                    extension: row.get(2)?,
+                    size_bytes: row.get::<_, i64>(3)? as u64,
+                    file_type: row.get(4)?,
+                    created_at: row.get(5)?,
+                    modified_at: row.get(6)?,
+                    extra_details: serde_json::from_str(&row.get::<_, String>(7)?)
+                        .unwrap_or_default(),
                     file_hash: hash.to_string(),
-                    cached_at,
-                    is_directory,
-                    tags: serde_json::from_str(&tags_json).unwrap_or_default(),
+                    cached_at: row.get(8)?,
+                    is_directory: row.get(9)?,
+                    tags: serde_json::from_str(&row.get::<_, String>(10)?).unwrap_or_default(),
                 })
             })
             .ok()?;
@@ -330,32 +344,19 @@ impl FileInspectorApp {
                 "SELECT file_hash, path, name, extension, size_bytes, file_type, created_at, modified_at, extra_details, cached_at, is_directory, tags FROM files"
             ) {
                 if let Ok(rows) = stmt.query_map([], |row| {
-                    let file_hash: String = row.get(0)?;
-                    let path_str: String = row.get(1)?;
-                    let name: String = row.get(2)?;
-                    let extension: String = row.get(3)?;
-                    let size_bytes: i64 = row.get(4)?;
-                    let file_type: String = row.get(5)?;
-                    let created_at: String = row.get(6)?;
-                    let modified_at: String = row.get(7)?;
-                    let extra_json: String = row.get(8)?;
-                    let cached_at: String = row.get(9)?;
-                    let is_directory: bool = row.get(10)?;
-                    let tags_json: String = row.get(11)?;
-
                     Ok(FileMetadataInfo {
-                        path: PathBuf::from(path_str),
-                        name,
-                        extension,
-                        size_bytes: size_bytes as u64,
-                        file_type,
-                        created_at,
-                        modified_at,
-                        extra_details: serde_json::from_str(&extra_json).unwrap_or_default(),
-                        file_hash,
-                        cached_at,
-                        is_directory,
-                        tags: serde_json::from_str(&tags_json).unwrap_or_default(),
+                        file_hash: row.get(0)?,
+                        path: PathBuf::from(row.get::<_, String>(1)?),
+                        name: row.get(2)?,
+                        extension: row.get(3)?,
+                        size_bytes: row.get::<_, i64>(4)? as u64,
+                        file_type: row.get(5)?,
+                        created_at: row.get(6)?,
+                        modified_at: row.get(7)?,
+                        extra_details: serde_json::from_str(&row.get::<_, String>(8)?).unwrap_or_default(),
+                        cached_at: row.get(9)?,
+                        is_directory: row.get(10)?,
+                        tags: serde_json::from_str(&row.get::<_, String>(11)?).unwrap_or_default(),
                     })
                 }) {
                     for r in rows.flatten() {
@@ -411,7 +412,6 @@ impl FileInspectorApp {
             .into_owned();
 
         if metadata.is_dir() {
-            let name = file_name;
             let created_at = metadata
                 .created()
                 .map(format_system_time)
@@ -444,7 +444,7 @@ impl FileInspectorApp {
 
             let dir_info = FileMetadataInfo {
                 path: path.clone(),
-                name,
+                name: file_name,
                 extension: "".into(),
                 size_bytes: 0,
                 file_type: "directory".into(),
@@ -615,12 +615,11 @@ impl FileInspectorApp {
             let path = file_info.path.clone();
             let extension = file_info.extension.clone();
 
-            let file_type = if extension.is_empty() {
+            file_info.file_type = if extension.is_empty() {
                 "unknown / binary".to_string()
             } else {
                 format!("{} file", extension).to_lowercase()
             };
-            file_info.file_type = file_type;
 
             for tag in &mut file_info.tags {
                 *tag = tag.to_lowercase();
@@ -688,6 +687,10 @@ impl FileInspectorApp {
         }
     }
 }
+
+// ============================================================================
+// Helper Utilities & Recursive Indexing Functions
+// ============================================================================
 
 fn is_file_excluded(file_name: &str, extension: &str, excluded_patterns: &[String]) -> bool {
     for pattern in excluded_patterns {
@@ -867,26 +870,6 @@ fn index_directory_recursive(
     (total_files, indexed_files, unindexed_types, unknown_types)
 }
 
-#[derive(Deserialize)]
-struct FFProbeOutput {
-    streams: Option<Vec<Stream>>,
-    format: Option<Format>,
-}
-
-#[derive(Deserialize)]
-struct Stream {
-    codec_type: String,
-    codec_name: Option<String>,
-    width: Option<u32>,
-    height: Option<u32>,
-}
-
-#[derive(Deserialize)]
-struct Format {
-    duration: Option<String>,
-    bit_rate: Option<String>,
-}
-
 fn get_media_info_via_ffprobe(path: &Path) -> Vec<(String, String)> {
     let mut details = Vec::new();
     let output = Command::new("ffprobe")
@@ -942,12 +925,6 @@ fn get_media_info_via_ffprobe(path: &Path) -> Vec<(String, String)> {
     details
 }
 
-struct TextStats {
-    language: String,
-    loc: usize,
-    chars: usize,
-}
-
 fn analyze_text_file(
     path: &Path,
     ext: &str,
@@ -1001,7 +978,6 @@ fn open_containing_folder(path: &str) {
     #[cfg(target_os = "windows")]
     {
         let target = path.trim_start_matches(r"\\?\").to_string();
-
         let _ = std::process::Command::new("explorer")
             .arg("/select,")
             .arg(&target)
@@ -1009,11 +985,15 @@ fn open_containing_folder(path: &str) {
     }
 }
 
+// ============================================================================
+// UI Implementation (egui)
+// ============================================================================
+
 impl eframe::App for FileInspectorApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.set_pixels_per_point(1.7);
 
-        // Handle indexing background worker progress
+        // Background indexing handler
         if let Some(rx) = &self.indexing_rx {
             ctx.request_repaint();
             match rx.try_recv() {
@@ -1072,6 +1052,7 @@ impl eframe::App for FileInspectorApp {
             }
         }
 
+        // Drag and drop handler
         ctx.input(|i| {
             if !i.raw.dropped_files.is_empty() {
                 if let Some(file) = i.raw.dropped_files.first() {
@@ -1082,7 +1063,7 @@ impl eframe::App for FileInspectorApp {
             }
         });
 
-        // 1. RIGHT PANEL: Search Results & Query Controls
+        // 1. Right Panel: Search Results & Query Controls
         egui::SidePanel::right("search_results_panel")
             .default_width(360.0)
             .resizable(true)
@@ -1157,10 +1138,8 @@ impl eframe::App for FileInspectorApp {
                     .cloned()
                     .collect();
 
-                if !matches.is_empty() {
-                    if ui.button("📤 Export Current Results").clicked() {
-                        self.export_to_json(&matches, "search_results");
-                    }
+                if !matches.is_empty() && ui.button("📤 Export Current Results").clicked() {
+                    self.export_to_json(&matches, "search_results");
                 }
 
                 ui.add_space(4.0);
@@ -1180,24 +1159,17 @@ impl eframe::App for FileInspectorApp {
                                 .map_or(false, |curr| curr.file_hash == file_info.file_hash);
 
                             ui.horizontal(|ui| {
-                                // File Select
                                 if ui.button("👆").clicked() {
-                                    let path = file_info.path.clone();
-                                    self.inspect_path(path);
+                                    self.inspect_path(file_info.path.clone());
                                 }
                                 let short_name = Self::truncate_name(&file_info.name, 15);
-                                let display_str = format!(
-                                    "{} [{}, {}]",
-                                    short_name,
-                                    file_info.file_type,
-                                    file_info.tags.join(", ")
-                                );
+                                let display_str =
+                                    format!("{} [{}]", short_name, file_info.tags.join(", "));
 
                                 let mut text = egui::RichText::new(display_str);
                                 if is_selected {
                                     text = text.color(egui::Color32::LIGHT_BLUE).strong();
                                 }
-
                                 ui.label(text);
                             });
                         }
@@ -1205,7 +1177,7 @@ impl eframe::App for FileInspectorApp {
                 });
             });
 
-        // 2. RIGHT PANEL (CentralPanel): General Attributes, Custom Tags Management, Parsed Format Metadata
+        // 2. Central Panel: Metadata, Custom Tags, & Parsed Attributes
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 if let Some(file_info) = &self.current_file {
@@ -1332,4 +1304,23 @@ impl eframe::App for FileInspectorApp {
             });
         });
     }
+}
+
+// ============================================================================
+// Entry Point
+// ============================================================================
+
+fn main() -> Result<(), eframe::Error> {
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([WIDTH, HEIGHT])
+            .with_drag_and_drop(true),
+        ..Default::default()
+    };
+
+    eframe::run_native(
+        "Advanced File Inspector",
+        options,
+        Box::new(|_cc| Ok(Box::new(FileInspectorApp::default()))),
+    )
 }
