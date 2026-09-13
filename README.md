@@ -1,16 +1,16 @@
-```text
+
+```markdown
   ███████╗██╗██╗     ███████╗    ██╗███╗   ██╗███████╗██████╗  █████╗  ██████╗████████╗ ██████╗ ██████╗ 
   ██╔════╝██║██║     ██╔════╝    ██║████╗  ██║██╔════╝██╔══██╗██╔══██╗██╔════╝╚══██╔══╝██╔═══██╗██╔══██╗
   █████╗  ██║██║     █████╗      ██║██╔██╗ ██║███████╗██████╔╝███████║██║        ██║   ██║   ██║██████╔╝
   ██╔══╝  ██║██║     ██╔══╝      ██║██║╚██╗██║╚════██║██╔═══╝ ██╔══██║██║        ██║   ██║   ██║██╔══██╗
   ██║     ██║███████╗███████╗    ██║██║ ╚████║███████║██║     ██║  ██║╚██████╗   ██║   ╚██████╔╝██║  ██║
   ╚═╝     ╚═╝╚══════╝╚══════╝    ╚═╝╚═╝  ╚═══╝╚══════╝╚═╝     ╚═╝  ╚═╝ ╚═════╝   ╚═╝    ╚═════╝ ╚═╝  ╚═╝
-
 ```
 
 ---
 
-## 1. Project Ideation
+## 1. Project Ideation & Vision
 
 ```text
   +-----------------------------------------------------------------+
@@ -20,9 +20,11 @@
   +-----------------------------------------------------------------+
 ```
 
-* **Core Concept**: Drag-and-drop or browse any file/folder to extract hashes, media codecs (via `ffprobe`), image dimensions, and lines of code.
+* **Core Concept**: Drag-and-drop or browse any file/folder to extract hashes, media information, preview images/text contents, and manage file tags seamlessly.
+
 * **Persistent Cache**: Automatically caches metadata and tags into a localized SQLite database (`file_inspector.db`) to ensure instant lookup speeds.
-* **Multi-Search & Tagging**: Empowers users to categorize items with custom comma-separated tags, filtering multi-faceted data sets on the fly.
+
+* **Multi-Search & Tagging**: Empowers users to categorize items with custom comma-separated tags, ordering and displaying tags reliably while filtering datasets on the fly.
 
 ---
 
@@ -37,15 +39,18 @@
                                          v
                               +-----------------------+
                               * External Workers &    *
-                              * CLI Tools (FFprobe)   *
+                              * File Parsers (Image)  *
                               +-----------------------+
 
 ```
 
-* **Frontend Layer**: Built with `eframe` and `egui` providing an immediate-mode graphical user interface.
-* **Controller / State Layer**: Handles recursive directory crawlers, SHA-256 hashing (`sha256`), and format parsers (`image`, `ffprobe`).
-* **Persistence Layer**: `rusqlite` handles transactional storage mapping hashes to structured file attributes and flexible tags.
+* **Frontend Layer**: Built with `eframe` and `egui` providing an immediate-mode graphical user interface with visual selected-file highlighting and live preview panels.
 
+
+* **Controller / State Layer**: Handles recursive directory crawlers, large directory optimization, smart file exclusions, SHA-256 hashing, and format/metadata parsers.
+
+
+* **Persistence Layer**: `rusqlite` handles transactional storage mapping hashes to structured file attributes, custom tags, and metadata updates.
 ---
 
 ## 3. Choice of Technologies
@@ -64,63 +69,67 @@
 
 ---
 
-## 4. Progress in Feature Implementation
+## 3. Notable Technical Decisions
 
-* **[x] Single File & Recursive Directory Inspection**: Crawls nested trees while skipping ignored directories (`.git`, `node_modules`, etc.).
-* **[x] Persistent SQLite Caching**: Eliminates duplicate hash recalculations by storing records in `file_inspector.db`.
-* **[x] Advanced Multi-Search & Filtering**: Search files instantaneously using comma-separated terms across names, tags, and extensions.
-* **[x] Tag Management & JSON Exports**: Add custom tags, save them back to the database, and export database subsets or search results to JSON.
-* **[x] Metadata Parsers**: Integrated support for image resolutions, source code lines-of-code (LOC) analysis, and multimedia properties.
+* **Transition from JSON to SQLite**: Migrated away from flat JSON file storage to an embedded SQLite database (`rusqlite`) to efficiently handle large directory indexing, concurrent lookups, and fast metadata/tag queries without performance degradation.
+* **Immediate-Mode UI Layout & Ergonomics**: Utilized `eframe`/`egui` to maintain immediate rendering loops coupled with selective component state management, preventing borrow-checker bottlenecks during high-frequency UI updates and tag mutations.
+* **Robust File Traversal & Exclusion Handling**: Implemented custom directory crawling filters to gracefully skip heavy version control directories (`.git`) and build folders (`node_modules`), ensuring responsiveness even when indexing extensive directory trees.
+* **Dedicated Batch Actions**: Introduced "Parse All" and "Update Metadata" operations to give users explicit control over bulk processing for scanned files and real-time metadata refreshes.
 
 ---
 
-## 5. Project Setup
+## 4. Progress in Feature Implementation
 
-1. **Prerequisites**: Ensure you have [Rust](https://www.rust-lang.org/) installed along with `ffprobe` (part of FFmpeg) available in your system path for media container analysis.
-2. **Clone & Configure**: Create a new Rust binary project and place the application code into `src/main.rs`.
+* **[x] Single File & Recursive Directory Indexing**: Handles massive directory trees efficiently with improved file exclusions and path management.
+
+
+* **[x] Persistent SQLite Caching**: Fast localized storage mapping file paths and hashes to tags and metadata.
+
+
+* **[x] Interactive File Previews**: Built-in image and text file content rendering directly inside the inspection layout.
+* **[x] Advanced Tagging & Ordering**: Custom tag assignment, structured ordered rendering, bug-free duplicate tag display prevention, and search filtering.
+* **[x] File Management & Navigation**: Selected file visual highlighting, quick access to open the parent directory containing the selected file, and batch "Parse All" / "Update Metadata" utilities.
+
+---
+
+## 5. Project Setup & Execution
+
+1. **Prerequisites**: Ensure you have [Rust](https://www.rust-lang.org/) installed.
+
+
+2. **Clone & Configure**: Clone the repository and inspect the workspace setup.
 3. **Dependencies (`Cargo.toml`)**:
 
 ```toml
-[package]
-name = "file_inspector"
-version = "0.1.0"
-edition = "2021"
-
 [dependencies]
-eframe = "0.29.0"
-egui = "0.29.0"
+eframe = "0.31" # Or your preferred recent egui/eframe version
+rfd = "0.15"   # Modern portable native file dialogs for Windows 11
+image = "0.25" # Image decoding & resolution inspection
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-toml = "0.8"
+chrono = "0.4" # Human-readable file timestamps
 sha256 = "1.5"
-image = "0.25"
-chrono = "0.4"
-rfd = "0.15"
 rusqlite = { version = "0.31", features = ["bundled"] }
 
+[profile.release]
+opt-level = "z"     # Optimize for size ('s' or 'z')
+lto = true          # Enable Link-Time Optimization across all crates
+codegen-units = 1   # Reduces parallel code generation to enable maximum LTO optimization
+panic = "abort"     # Removes unwinding landing pads (removes string bloat)
+strip = true        # Strips debug symbols and symbol tables automatically
 ```
+
+4. **Run Commands**:
+* Build for release: `cargo build --release`
+
+* Run application: `cargo run`
+
+
+
 
 ---
 
-## 6. Run Commands
-
-```text
-  +-----------------------------------------------------------------+
-  * # Build for development release                                 *
-  * $ cargo build --release                                         *
-  *                                                                 *
-  * # Run the application directly                                  *
-  * $ cargo run                                                     *
-  +-----------------------------------------------------------------+
-
-```
-
 ### Screenshots
-<!-- - <img src="./screenshots/file-inspector_v1.webp" alt="v1" width="480">
-- <img src="./screenshots/file-inspector_v2.webp" alt="v2" width="480">
-- <img src="./screenshots/file-inspector_v3.webp" alt="v3" width="480">
-- <img src="./screenshots/file-inspector_v4.webp" alt="v4" width="480">
-- <img src="./screenshots/file-inspector_v5.webp" alt="v5" width="480">
-- <img src="./screenshots/file-inspector_v6.webp" alt="v6" width="480"> -->
-<img src="./screenshots/file-inspector_v7a.webp" alt="v7a" width="480">
-<img src="./screenshots/file-inspector_v7b.webp" alt="v7b" width="480">
+
+<img src="./screenshots/file-inspector_v7a.webp" alt="v7a" width="480" height="400">
+<img src="./screenshots/file-inspector_v7b.webp" alt="v7b" width="480" height="400">
