@@ -13,7 +13,7 @@ use std::time::SystemTime;
 // Constants & Configuration Types
 // ============================================================================
 
-const WIDTH: f32 = 1100.0;
+const WIDTH: f32 = 1200.0;
 const HEIGHT: f32 = 780.0;
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -435,8 +435,8 @@ impl FileInspectorApp {
         let mut unique_tags: HashSet<String> = HashSet::new();
         for tag in &file_info.tags {
             let cleaned = tag.trim().to_lowercase();
-            // Avoid adding a standalone extension tag if it's already redundant with the file type
-            if !cleaned.is_empty() && cleaned != "scanned" {
+            // Filter out "scanned" and "parsed" so they are managed explicitly
+            if !cleaned.is_empty() && cleaned != "scanned" && cleaned != "parsed" {
                 if file_info.extension == cleaned && file_info.file_type.contains(&cleaned) {
                     continue;
                 }
@@ -444,13 +444,13 @@ impl FileInspectorApp {
             }
         }
 
-        // Remove core tags from unique_tags to prevent duplication in other-tags
         unique_tags.remove(&file_info.file_type);
         unique_tags.remove(&file_info.year);
         unique_tags.remove(&file_info.month);
 
         let mut updated_tags = Vec::new();
         updated_tags.push(file_info.file_type.clone());
+        // updated_tags.push("parsed".to_string()); // Ensure "parsed" tag is assigned and "scanned" is removed
         updated_tags.push(file_info.year.clone());
         updated_tags.push(file_info.month.clone());
 
@@ -548,6 +548,8 @@ impl FileInspectorApp {
                 if file_info.tags.iter().any(|t| t == "scanned") {
                     self.refresh_file_metadata(&mut file_info);
 
+                    self.status_message = format!("Parsing: {}", file_info.name);
+
                     let extra_json =
                         serde_json::to_string(&file_info.extra_details).unwrap_or_default();
                     let tags_json = serde_json::to_string(&file_info.tags).unwrap_or_default();
@@ -621,6 +623,71 @@ impl FileInspectorApp {
                 .map(format_system_time)
                 .unwrap_or_else(|_| "Unavailable".to_string());
 
+            let (year, month) = if let Ok(modified_time) = metadata.modified() {
+                let datetime: chrono::DateTime<chrono::Local> = modified_time.into();
+                (
+                    datetime.format("%Y").to_string().to_lowercase(),
+                    datetime.format("%B").to_string().to_lowercase(),
+                )
+            } else {
+                ("unknown".into(), "unknown".into())
+            };
+
+            let (dir_size, file_count, folder_count) = calculate_dir_stats(&path);
+            let dir_hash = format!("dir_{}", path.to_string_lossy());
+
+            // Check if directory is already indexed and matches size, file count, and folder count
+            if let Some(mut existing_dir) = self.get_from_db(&dir_hash) {
+                let mut existing_file_count = 0;
+                let mut existing_folder_count = 0;
+
+                for (k, v) in &existing_dir.extra_details {
+                    if k == "Number of Files" {
+                        existing_file_count = v.parse().unwrap_or(0);
+                    } else if k == "Number of Folders" {
+                        existing_folder_count = v.parse().unwrap_or(0);
+                    }
+                }
+
+                if existing_dir.size_bytes == dir_size
+                    && existing_file_count == file_count
+                    && existing_folder_count == folder_count
+                {
+                    // Match found: skip re-indexing
+                    // Ensure "scanned" is removed/replaced with "parsed" if applicable
+                    let mut updated = false;
+                    if let Some(pos) = existing_dir.tags.iter().position(|t| t == "scanned") {
+                        existing_dir.tags.remove(pos);
+                        if !existing_dir.tags.contains(&"parsed".to_string()) {
+                            existing_dir.tags.push("parsed".to_string());
+                        }
+                        updated = true;
+                    }
+                    if updated {
+                        self.save_to_db(&existing_dir);
+                    }
+
+                    self.tag_input_buffer = existing_dir.tags.join(", ");
+                    self.current_file = Some(existing_dir);
+                    self.status_message =
+                        "Directory match found in DB. Skipped re-indexing.".to_string();
+                    return;
+                }
+            }
+
+            // Otherwise, proceed with background indexing as normal
+            let extra_details = vec![
+                ("Number of Files".into(), file_count.to_string()),
+                ("Number of Folders".into(), folder_count.to_string()),
+                (
+                    "Total Size".into(),
+                    format!("{} ({} bytes)", format_file_size(dir_size), dir_size),
+                ),
+                ("Status".into(), "Indexing in background...".into()),
+            ];
+
+            let initial_tags = vec!["directory".to_string(), year.clone(), month.clone()];
+
             let path_clone = path.clone();
             let config_clone = self.config.clone();
             let db_path_clone = self.db_path.clone();
@@ -646,20 +713,21 @@ impl FileInspectorApp {
                 path: path.clone(),
                 name: file_name,
                 extension: "".into(),
-                size_bytes: 0,
+                size_bytes: dir_size,
                 file_type: "directory".into(),
-                year: "unknown".into(),
-                month: "unknown".into(),
+                year,
+                month,
                 created_at,
                 modified_at,
-                extra_details: vec![("Status".into(), "Indexing in background...".into())],
-                file_hash: format!("dir_{}", path.to_string_lossy()),
+                extra_details,
+                file_hash: dir_hash,
                 cached_at: format_system_time(SystemTime::now()),
                 is_directory: true,
-                tags: vec!["directory".into()],
+                tags: initial_tags,
             };
 
             self.tag_input_buffer = dir_info.tags.join(", ");
+            self.save_to_db(&dir_info);
             self.current_file = Some(dir_info);
             return;
         }
@@ -673,8 +741,16 @@ impl FileInspectorApp {
         };
 
         if let Some(mut cached_info) = self.get_from_db(&file_hash) {
+            // If it was previously scanned, parsing it now removes "scanned" and assigns "parsed"
+            let mut updated = false;
             if let Some(pos) = cached_info.tags.iter().position(|t| t == "scanned") {
-                cached_info.tags[pos] = "parsed".to_string();
+                cached_info.tags.remove(pos);
+                // if !cached_info.tags.contains(&"parsed".to_string()) {
+                //     cached_info.tags.push("parsed".to_string());
+                // }
+                updated = true;
+            }
+            if updated {
                 self.save_to_db(&cached_info);
             }
             self.tag_input_buffer = cached_info.tags.join(", ");
@@ -708,7 +784,7 @@ impl FileInspectorApp {
 
         let initial_tags = vec![
             file_type.clone(),
-            "parsed".to_string(),
+            // "parsed".to_string(),
             month.clone(),
             year.clone(),
         ];
@@ -795,26 +871,64 @@ impl FileInspectorApp {
     }
 
     fn save_current_tags(&mut self) {
+        let parsed_tags: Vec<String> = self
+            .tag_input_buffer
+            .split(',')
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect();
+
         if let Some(file_info) = &mut self.current_file {
-            let parsed_tags: Vec<String> = self
-                .tag_input_buffer
-                .split(',')
-                .map(|s| s.trim().to_lowercase())
-                .filter(|s| !s.is_empty())
+            file_info.tags = parsed_tags.clone();
+        }
+
+        let file_info = match &self.current_file {
+            Some(info) => info.clone(),
+            None => return,
+        };
+
+        if file_info.is_directory {
+            self.save_to_db(&file_info);
+
+            let core_tags: HashSet<String> = [
+                "directory".to_string(),
+                file_info.year.clone(),
+                file_info.month.clone(),
+            ]
+            .into_iter()
+            .collect();
+
+            let other_tags: Vec<String> = parsed_tags
+                .into_iter()
+                .filter(|t| !core_tags.contains(t))
                 .collect();
 
-            file_info.tags = parsed_tags;
-
-            if file_info.is_directory {
-                self.status_message =
-                    "Tags updated in current view (Directories are not cached by hash)."
-                        .to_string();
-            } else {
-                let info_clone = file_info.clone();
-                self.save_to_db(&info_clone);
-                self.status_message =
-                    "Tags updated and saved to SQLite database successfully!".to_string();
+            if !other_tags.is_empty() {
+                let dir_path_str = file_info.path.to_string_lossy().to_string();
+                let all_files = Self::fetch_all_from_db_with_conn(&self.db_path);
+                for mut child in all_files {
+                    let child_path_str = child.path.to_string_lossy().to_string();
+                    if child_path_str.starts_with(&dir_path_str) && child_path_str != dir_path_str {
+                        let mut updated = false;
+                        for ot in &other_tags {
+                            if !child.tags.contains(ot) {
+                                child.tags.push(ot.clone());
+                                updated = true;
+                            }
+                        }
+                        if updated {
+                            self.save_to_db(&child);
+                        }
+                    }
+                }
             }
+
+            self.status_message =
+                "Directory tags saved and propagated to children successfully!".to_string();
+        } else {
+            self.save_to_db(&file_info);
+            self.status_message =
+                "Tags updated and saved to SQLite database successfully!".to_string();
         }
     }
 
@@ -841,6 +955,30 @@ impl FileInspectorApp {
 // ============================================================================
 // Helper Utilities & Recursive Indexing Functions
 // ============================================================================
+
+fn calculate_dir_stats(path: &Path) -> (u64, usize, usize) {
+    let mut total_size = 0;
+    let mut file_count = 0;
+    let mut folder_count = 0;
+    if let Ok(entries) = fs::read_dir(path) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                folder_count += 1;
+                let (s, f, d) = calculate_dir_stats(&p);
+                total_size += s;
+                file_count += f;
+                folder_count += d;
+            } else if p.is_file() {
+                file_count += 1;
+                if let Ok(m) = fs::metadata(&p) {
+                    total_size += m.len();
+                }
+            }
+        }
+    }
+    (total_size, file_count, folder_count)
+}
 
 fn is_file_excluded(file_name: &str, extension: &str, excluded_patterns: &[String]) -> bool {
     for pattern in excluded_patterns {
@@ -1180,6 +1318,7 @@ impl eframe::App for FileInspectorApp {
 
                     if let Some(file_info) = &mut self.current_file {
                         let mut extra_details = Vec::new();
+                        extra_details.push(("Status".into(), "Indexed Complete".into()));
                         extra_details
                             .push(("Total Files Encountered".into(), total_files.to_string()));
                         extra_details.push((
@@ -1208,22 +1347,6 @@ impl eframe::App for FileInspectorApp {
                                 .join(", ")
                         };
                         extra_details.push(("Unknown File Types".into(), unknown_summary));
-
-                        // Aggregate tag counts across all indexed files in the database[cite: 5]
-                        let all_files = Self::fetch_all_from_db_with_conn(&self.db_path);
-                        let mut tag_counts: HashMap<String, usize> = HashMap::new();
-                        for file in &all_files {
-                            for tag in &file.tags {
-                                *tag_counts.entry(tag.clone()).or_insert(0) += 1;
-                            }
-                        }
-
-                        let mut sorted_tags: Vec<_> = tag_counts.into_iter().collect();
-                        sorted_tags.sort_by(|a, b| a.0.cmp(&b.0));
-
-                        for (tag, count) in sorted_tags {
-                            extra_details.push((tag, format!("{} files", count)));
-                        }
 
                         file_info.extra_details = extra_details;
                     }
@@ -1472,6 +1595,18 @@ impl eframe::App for FileInspectorApp {
                                     ui.label("Size");
                                     ui.label(format!("{} ({} bytes)", format_file_size(size_bytes), size_bytes));
                                     ui.end_row();
+                                } else {
+                                    ui.label("Year");
+                                    ui.label(&year);
+                                    ui.end_row();
+
+                                    ui.label("Month");
+                                    ui.label(&month);
+                                    ui.end_row();
+
+                                    ui.label("Total Size");
+                                    ui.label(format!("{} ({} bytes)", format_file_size(size_bytes), size_bytes));
+                                    ui.end_row();
                                 }
 
                                 ui.label("Created At");
@@ -1497,7 +1632,7 @@ impl eframe::App for FileInspectorApp {
                             if ui.button("💾 Save Tags").clicked() {
                                 self.save_current_tags();
                             }
-                            if ui.button("🔄 Update Metadata").clicked() {
+                            if !is_directory && ui.button("🔄 Update Metadata").clicked() {
                                 self.update_current_file_metadata();
                             }
                         });

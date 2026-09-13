@@ -1,0 +1,100 @@
+{
+  "language_extensions": {
+    "h": "C/C++ Header",
+    "hpp": "C++ Header",
+    "cpp": "C++ Source",
+    "c": "C Source",
+    "json": "JSON Data",
+    "html": "HTML Markup",
+    "css": "Cascading Style Sheets",
+    "yaml": "YAML Config",
+    "toml": "TOML Config",
+    "ts": "TypeScript",
+    "xml": "XML Document",
+    "yml": "YAML Config",
+    "md": "Markdown",
+    "rs": "Rust",
+    "js": "JavaScript",
+    "py": "Python",
+    "cs": "C# Source",
+    "go": "Go Source",
+    "bas": "Q/Basic Source"
+  },
+  "search_criteria": {
+    "image_extensions": [
+      "png",
+      "jpg",
+      "jpeg",
+      "webp",
+      "bmp",
+      "gif",
+      "tiff"
+    ],
+    "media_extensions": [
+      "mp3",
+      "mp4",
+      "mkv",
+      "wav",
+      "flac",
+      "ogg",
+      "m4a",
+      "aac",
+      "avi",
+      "mov",
+      "webm",
+      "opus"
+    ],
+    "text_extensions": [
+      "rs",
+      "txt",
+      "md",
+      "toml",
+      "json",
+      "js",
+      "ts",
+      "py",
+      "html",
+      "css",
+      "c",
+      "cpp",
+      "h",
+      "hpp",
+      "xml",
+      "yaml",
+      "yml",
+      "cs",
+      "go",
+      "bas"
+    ]
+  },
+  "included_files": [
+    "important.txt",
+    "config.toml"
+  ],
+  "excluded_files": [
+    ".DS_Store",
+    "Thumbs.db",
+    "desktop.ini",
+    "*.meta",
+    "*.dll",
+    "*.resS",
+    "*.renderTexture",
+    "*.mat",
+    "*.dat",
+    "*.pyi",
+    "*.mo"
+  ],
+  "ignored_folders": [
+    ".git",
+    "node_modules",
+    "target",
+    ".vs",
+    ".vsconfig",
+    ".idea",
+    "PackageCache",
+    "Library",
+    "Logs",
+    "Packages",
+    "MonoBleedingEdge"
+  ]
+}
