@@ -16,6 +16,8 @@ use std::time::SystemTime;
 const WIDTH: f32 = 1200.0;
 const HEIGHT: f32 = 780.0;
 
+const MAX_PREVIEW_LINES: usize = 200;
+
 #[derive(Clone, Serialize, Deserialize)]
 struct SearchCriteria {
     image_extensions: Vec<String>,
@@ -202,6 +204,7 @@ struct FileInspectorApp {
     is_indexing: bool,
     indexing_rx: Option<Receiver<IndexProgress>>,
     current_indexing_file: String,
+    preview_texture: Option<(String, egui::TextureHandle)>,
 }
 
 impl Default for FileInspectorApp {
@@ -235,6 +238,7 @@ impl Default for FileInspectorApp {
             is_indexing: false,
             indexing_rx: None,
             current_indexing_file: String::new(),
+            preview_texture: None,
         };
 
         app.init_db();
@@ -870,6 +874,39 @@ impl FileInspectorApp {
         self.status_message = "File indexed and stored in SQLite successfully.".to_string();
     }
 
+    fn ensure_preview_texture(&mut self, ctx: &egui::Context, file_info: &FileMetadataInfo) {
+        let extension = file_info.extension.to_lowercase();
+        if !self
+            .config
+            .search_criteria
+            .image_extensions
+            .contains(&extension)
+        {
+            self.preview_texture = None;
+            return;
+        }
+
+        if self
+            .preview_texture
+            .as_ref()
+            .map_or(false, |(hash, _)| hash == &file_info.file_hash)
+        {
+            return;
+        }
+
+        self.preview_texture = image::open(&file_info.path).ok().map(|img| {
+            let rgba = img.to_rgba8();
+            let size = [rgba.width() as usize, rgba.height() as usize];
+            let color_image = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
+            let texture = ctx.load_texture(
+                format!("preview_{}", file_info.file_hash),
+                color_image,
+                egui::TextureOptions::LINEAR,
+            );
+            (file_info.file_hash.clone(), texture)
+        });
+    }
+
     fn save_current_tags(&mut self) {
         let parsed_tags: Vec<String> = self
             .tag_input_buffer
@@ -1293,7 +1330,7 @@ fn open_containing_folder(path: &str) {
 
 impl eframe::App for FileInspectorApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        ctx.set_pixels_per_point(1.7);
+        ctx.set_pixels_per_point(1.8);
 
         // Background indexing handler
         if let Some(rx) = &self.indexing_rx {
@@ -1531,7 +1568,7 @@ impl eframe::App for FileInspectorApp {
         // 2. Central Panel: Metadata, Custom Tags, & Parsed Attributes
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
-                if let Some(file_info) = &self.current_file {
+                if let Some(file_info) = self.current_file.clone() {
                     let is_directory = file_info.is_directory;
                     let name = file_info.name.clone();
                     let path_str = file_info.path.to_string_lossy().to_string();
@@ -1667,6 +1704,57 @@ impl eframe::App for FileInspectorApp {
                                         ui.end_row();
                                     }
                                 });
+                        });
+                    }
+
+                    if !is_directory {
+                        ui.add_space(10.0);
+                        ui.group(|ui| {
+                            ui.set_width(ui.available_width());
+                            ui.strong("Preview");
+                            ui.add_space(6.0);
+
+                            let is_image = self.config.search_criteria.image_extensions.contains(&extension);
+                            let is_text = self.config.search_criteria.text_extensions.contains(&extension);
+
+                            if is_image {
+                                let preview_info = file_info.clone();
+                                self.ensure_preview_texture(ctx, &preview_info);
+
+                                if let Some((_, texture)) = &self.preview_texture {
+                                    let available_width = ui.available_width();
+                                    let texture_size = texture.size_vec2();
+                                    let scale = (available_width / texture_size.x).min(1.0);
+                                    let desired_size = texture_size * scale;
+                                    ui.add(egui::Image::from_texture(texture).fit_to_exact_size(desired_size));
+                                } else {
+                                    ui.label(egui::RichText::new("Unable to load image preview.").color(egui::Color32::GRAY));
+                                }
+                            } else if is_text {
+                                match fs::read_to_string(&file_info.path) {
+                                    Ok(content) => {
+                                        let total_lines = content.lines().count();
+                                        let preview: String = content.lines().take(MAX_PREVIEW_LINES).collect::<Vec<_>>().join("\n");
+
+                                        egui::ScrollArea::vertical()
+                                            .max_height(420.0)
+                                            .auto_shrink([false, true])
+                                            .show(ui, |ui| {
+                                                ui.add(egui::Label::new(egui::RichText::new(preview).monospace()).wrap());
+                                            });
+
+                                        if total_lines > MAX_PREVIEW_LINES {
+                                            ui.add_space(4.0);
+                                            ui.label(egui::RichText::new(format!("Showing first {} of {} lines.", MAX_PREVIEW_LINES, total_lines)).italics().color(egui::Color32::GRAY));
+                                        }
+                                    }
+                                    Err(error) => {
+                                        ui.label(egui::RichText::new(format!("Unable to read text preview: {}", error)).color(egui::Color32::GRAY));
+                                    }
+                                }
+                            } else {
+                                ui.label(egui::RichText::new("Preview is available for configured image and text file types.").italics().color(egui::Color32::GRAY));
+                            }
                         });
                     }
                 } else {

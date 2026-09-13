@@ -12,3 +12,10 @@ serde_json = "1.0"
 chrono = "0.4" # Human-readable file timestamps
 sha256 = "1.5"
 rusqlite = { version = "0.31", features = ["bundled"] }
+
+[profile.release]
+opt-level = "z"     # Optimize for size ('s' or 'z')
+lto = true          # Enable Link-Time Optimization across all crates
+codegen-units = 1   # Reduces parallel code generation to enable maximum LTO optimization
+panic = "abort"     # Removes unwinding landing pads (removes string bloat)
+strip = true        # Strips debug symbols and symbol tables automatically
