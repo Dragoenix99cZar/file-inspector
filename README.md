@@ -116,9 +116,11 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 ```
 
 ### Screenshots
-- <img src="./screenshots/file-inspector_v1.webp" alt="v1" width="480">
+<!-- - <img src="./screenshots/file-inspector_v1.webp" alt="v1" width="480">
 - <img src="./screenshots/file-inspector_v2.webp" alt="v2" width="480">
 - <img src="./screenshots/file-inspector_v3.webp" alt="v3" width="480">
 - <img src="./screenshots/file-inspector_v4.webp" alt="v4" width="480">
 - <img src="./screenshots/file-inspector_v5.webp" alt="v5" width="480">
-- <img src="./screenshots/file-inspector_v6.webp" alt="v6" width="480">
+- <img src="./screenshots/file-inspector_v6.webp" alt="v6" width="480"> -->
+<img src="./screenshots/file-inspector_v7a.webp" alt="v7a" width="480">
+<img src="./screenshots/file-inspector_v7b.webp" alt="v7b" width="480">
