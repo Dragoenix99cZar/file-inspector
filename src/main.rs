@@ -201,7 +201,7 @@ struct FileInspectorApp {
     search_query: String,
     and_query: String,
     or_query: String,
-    not_query: String, // Added NOT query field
+    not_query: String,
     is_indexing: bool,
     indexing_rx: Option<Receiver<IndexProgress>>,
     current_indexing_file: String,
@@ -236,7 +236,7 @@ impl Default for FileInspectorApp {
             search_query: String::new(),
             and_query: String::new(),
             or_query: String::new(),
-            not_query: String::new(), // Initialized NOT query
+            not_query: String::new(),
             is_indexing: false,
             indexing_rx: None,
             current_indexing_file: String::new(),
@@ -392,7 +392,6 @@ impl FileInspectorApp {
         list
     }
 
-    // Helper to delete specific hashes from DB
     fn delete_hashes_from_db(&mut self, hashes: &[String]) {
         if hashes.is_empty() {
             return;
@@ -591,14 +590,12 @@ impl FileInspectorApp {
             };
 
             for mut file_info in all_files {
-                // Verify if the file or directory still exists physically on disk
                 if !file_info.path.exists() {
                     let _ = delete_stmt.execute(params![file_info.file_hash]);
                     removed_count += 1;
                     continue;
                 }
 
-                // Parse or refresh metadata for files that are marked 'scanned' or if you want a complete re-check
                 if file_info.tags.iter().any(|t| t == "scanned") {
                     self.refresh_file_metadata(&mut file_info);
 
@@ -637,7 +634,6 @@ impl FileInspectorApp {
             self.status_message = "Failed to commit database transaction.".to_string();
         }
 
-        // Refresh currently viewed file state if applicable
         if let Some(curr) = &self.current_file {
             let h = curr.file_hash.clone();
             if !curr.path.exists() {
@@ -1513,7 +1509,6 @@ impl eframe::App for FileInspectorApp {
                     }
                 });
 
-                // Added NOT query input row
                 ui.horizontal(|ui| {
                     ui.label("🚫 NOT:");
                     ui.add(egui::TextEdit::singleline(&mut self.not_query).desired_width(203.0));
@@ -1581,7 +1576,6 @@ impl eframe::App for FileInspectorApp {
                             return false;
                         }
 
-                        // Exclude matches that satisfy any NOT term
                         if !not_terms.is_empty() && not_terms.iter().any(|t| matches_term(t)) {
                             return false;
                         }
@@ -1596,7 +1590,6 @@ impl eframe::App for FileInspectorApp {
                         if ui.button("📤 Export Results").clicked() {
                             self.export_to_json(&matches, "search_results");
                         }
-                        // Added Delete from DB button for the filtered list
                         if ui.button("🗑️ Delete from DB").clicked() {
                             let hashes_to_delete: Vec<String> =
                                 matches.iter().map(|m| m.file_hash.clone()).collect();
@@ -1640,9 +1633,14 @@ impl eframe::App for FileInspectorApp {
                 });
             });
 
-        // 2. Central Panel: Metadata, Custom Tags, & Parsed Attributes
+        // 2. Central Panel: Metadata, Tag Statistics, or Drop Prompt
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
+                let queries_are_empty = self.search_query.is_empty()
+                    && self.and_query.is_empty()
+                    && self.or_query.is_empty()
+                    && self.not_query.is_empty();
+
                 if let Some(file_info) = self.current_file.clone() {
                     let is_directory = file_info.is_directory;
                     let name = file_info.name.clone();
@@ -1831,6 +1829,47 @@ impl eframe::App for FileInspectorApp {
                                 ui.label(egui::RichText::new("Preview is available for configured image and text file types.").italics().color(egui::Color32::GRAY));
                             }
                         });
+                    }
+                } else if queries_are_empty {
+                    // Show Tag Statistics when query, AND, OR, NOT fields are empty and no file is selected
+                    let all_files = self.fetch_all_from_db();
+                    let mut tag_counts: HashMap<String, usize> = HashMap::new();
+
+                    for file in &all_files {
+                        for tag in &file.tags {
+                            *tag_counts.entry(tag.clone()).or_insert(0) += 1;
+                        }
+                    }
+
+                    let mut sorted_tags: Vec<(String, usize)> = tag_counts.into_iter().collect();
+                    sorted_tags.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+                    ui.add_space(10.0);
+                    ui.heading("Database Tag Statistics");
+                    ui.add_space(8.0);
+
+                    if sorted_tags.is_empty() {
+                        ui.label(
+                            egui::RichText::new("No tags found in the database.")
+                                .italics()
+                                .color(egui::Color32::GRAY),
+                        );
+                    } else {
+                        egui::Grid::new("tag_statistics_grid")
+                            .num_columns(2)
+                            .spacing([40.0, 8.0])
+                            .striped(true)
+                            .show(ui, |ui| {
+                                ui.strong("Tag Name");
+                                ui.strong("File Count");
+                                ui.end_row();
+
+                                for (tag_name, count) in sorted_tags {
+                                    ui.label(format!("[{}]", tag_name));
+                                    ui.label(count.to_string());
+                                    ui.end_row();
+                                }
+                            });
                     }
                 } else {
                     ui.add_space(120.0);
