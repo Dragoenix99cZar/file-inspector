@@ -1590,7 +1590,7 @@ impl eframe::App for FileInspectorApp {
                         if ui.button("📤 Export Results").clicked() {
                             self.export_to_json(&matches, "search_results");
                         }
-                        if ui.button("🗑️ Delete from DB").clicked() {
+                        if ui.button("🗑️Delete from DB").clicked() {
                             let hashes_to_delete: Vec<String> =
                                 matches.iter().map(|m| m.file_hash.clone()).collect();
                             self.delete_hashes_from_db(&hashes_to_delete);
@@ -1847,6 +1847,8 @@ impl eframe::App for FileInspectorApp {
                     ui.add_space(10.0);
                     ui.heading("Database Tag Statistics");
                     ui.add_space(8.0);
+                    ui.label(egui::RichText::new("Click on any tag below to filter files in the search results panel:").italics());
+                    ui.add_space(4.0);
 
                     if sorted_tags.is_empty() {
                         ui.label(
@@ -1865,7 +1867,9 @@ impl eframe::App for FileInspectorApp {
                                 ui.end_row();
 
                                 for (tag_name, count) in sorted_tags {
-                                    ui.label(format!("[{}]", tag_name));
+                                    if ui.button(format!("[{}]", tag_name)).clicked() {
+                                        self.search_query = tag_name.clone();
+                                    }
                                     ui.label(count.to_string());
                                     ui.end_row();
                                 }
