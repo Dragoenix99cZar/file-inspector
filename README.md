@@ -131,7 +131,15 @@ strip = true        # Strips debug symbols and symbol tables automatically
 
 ### Screenshots
 
-<img src="./screenshots/file-inspector_v7a.webp" alt="v7a" width="480" height="400">
-<img src="./screenshots/file-inspector_v7b.webp" alt="v7b" width="480" height="400">
+<img src="./screenshots/file-inspector_v8.webp" alt="v8" width="480" height="400">
+
+<img src="./screenshots/file-inspector_v7a.webp" alt="v7b" width="240" height="200">
+<img src="./screenshots/file-inspector_v7b.webp" alt="v7a" width="240" height="200">
+<img src="./screenshots/file-inspector_v6.webp" alt="v6" width="240" height="200">
+<img src="./screenshots/file-inspector_v5.webp" alt="v5" width="240" height="200">
+<img src="./screenshots/file-inspector_v4.webp" alt="v4" width="240" height="200">
+<img src="./screenshots/file-inspector_v3.webp" alt="v3" width="240" height="200">
+<img src="./screenshots/file-inspector_v2.webp" alt="v2" width="240" height="200">
+<img src="./screenshots/file-inspector_v1.webp" alt="v1" width="240" height="200">
 
 
