@@ -80,15 +80,15 @@
 
 ## 4. Progress in Feature Implementation
 
-* **[x] Single File & Recursive Directory Indexing**: Handles massive directory trees efficiently with improved file exclusions and path management.
+- [x] **Single File & Recursive Directory Indexing**: Handles massive directory trees efficiently with improved file exclusions and path management.
 
 
-* **[x] Persistent SQLite Caching**: Fast localized storage mapping file paths and hashes to tags and metadata.
+- [x] **Persistent SQLite Caching**: Fast localized storage mapping file paths and hashes to tags and metadata.
 
 
-* **[x] Interactive File Previews**: Built-in image and text file content rendering directly inside the inspection layout.
-* **[x] Advanced Tagging & Ordering**: Custom tag assignment, structured ordered rendering, bug-free duplicate tag display prevention, and search filtering.
-* **[x] File Management & Navigation**: Selected file visual highlighting, quick access to open the parent directory containing the selected file, and batch "Parse All" / "Update Metadata" utilities.
+- [x] **Interactive File Previews**: Built-in image and text file content rendering directly inside the inspection layout.
+- [x] **Advanced Tagging & Ordering**: Custom tag assignment, structured ordered rendering, bug-free duplicate tag display prevention, and search filtering.
+- [x] **File Management & Navigation**: Selected file visual highlighting, quick access to open the parent directory containing the selected file, and batch "Parse All" / "Update Metadata" utilities.
 
 ---
 
@@ -133,3 +133,5 @@ strip = true        # Strips debug symbols and symbol tables automatically
 
 <img src="./screenshots/file-inspector_v7a.webp" alt="v7a" width="480" height="400">
 <img src="./screenshots/file-inspector_v7b.webp" alt="v7b" width="480" height="400">
+
+

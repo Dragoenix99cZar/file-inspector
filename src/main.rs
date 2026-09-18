@@ -201,6 +201,7 @@ struct FileInspectorApp {
     search_query: String,
     and_query: String,
     or_query: String,
+    not_query: String, // Added NOT query field
     is_indexing: bool,
     indexing_rx: Option<Receiver<IndexProgress>>,
     current_indexing_file: String,
@@ -235,6 +236,7 @@ impl Default for FileInspectorApp {
             search_query: String::new(),
             and_query: String::new(),
             or_query: String::new(),
+            not_query: String::new(), // Initialized NOT query
             is_indexing: false,
             indexing_rx: None,
             current_indexing_file: String::new(),
@@ -390,6 +392,38 @@ impl FileInspectorApp {
         list
     }
 
+    // Helper to delete specific hashes from DB
+    fn delete_hashes_from_db(&mut self, hashes: &[String]) {
+        if hashes.is_empty() {
+            return;
+        }
+        let conn = match Connection::open(&self.db_path) {
+            Ok(c) => c,
+            Err(_) => {
+                self.status_message = "Failed to open database for deletion.".to_string();
+                return;
+            }
+        };
+
+        let mut count = 0;
+        for h in hashes {
+            if conn
+                .execute("DELETE FROM files WHERE file_hash = ?", params![h])
+                .is_ok()
+            {
+                count += 1;
+            }
+        }
+
+        self.status_message = format!("Successfully deleted {} item(s) from the database.", count);
+
+        if let Some(curr) = &self.current_file {
+            if hashes.contains(&curr.file_hash) {
+                self.current_file = None;
+            }
+        }
+    }
+
     fn export_to_json(&mut self, items: &[FileMetadataInfo], label: &str) {
         if let Some(path) = rfd::FileDialog::new()
             .set_file_name(&format!("exported_{}.json", label))
@@ -439,7 +473,6 @@ impl FileInspectorApp {
         let mut unique_tags: HashSet<String> = HashSet::new();
         for tag in &file_info.tags {
             let cleaned = tag.trim().to_lowercase();
-            // Filter out "scanned" and "parsed" so they are managed explicitly
             if !cleaned.is_empty() && cleaned != "scanned" && cleaned != "parsed" {
                 if file_info.extension == cleaned && file_info.file_type.contains(&cleaned) {
                     continue;
@@ -454,7 +487,6 @@ impl FileInspectorApp {
 
         let mut updated_tags = Vec::new();
         updated_tags.push(file_info.file_type.clone());
-        // updated_tags.push("parsed".to_string()); // Ensure "parsed" tag is assigned and "scanned" is removed
         updated_tags.push(file_info.year.clone());
         updated_tags.push(file_info.month.clone());
 
@@ -518,12 +550,14 @@ impl FileInspectorApp {
 
     fn parse_all_scanned(&mut self) {
         let all_files = Self::fetch_all_from_db_with_conn(&self.db_path);
-        let mut count = 0;
+        let mut parsed_count = 0;
+        let mut removed_count = 0;
 
         let mut conn = match Connection::open(&self.db_path) {
             Ok(c) => c,
             Err(_) => {
-                self.status_message = "Failed to open database for parsing.".to_string();
+                self.status_message =
+                    "Failed to open database for parsing and verification.".to_string();
                 return;
             }
         };
@@ -537,28 +571,42 @@ impl FileInspectorApp {
         };
 
         {
-            let mut stmt = match tx.prepare(
+            let mut insert_stmt = match tx.prepare(
                 "INSERT OR REPLACE INTO files (file_hash, path, name, extension, size_bytes, file_type, year, month, created_at, modified_at, extra_details, cached_at, is_directory, tags)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)"
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)"
             ) {
                 Ok(s) => s,
                 Err(_) => {
-                    self.status_message = "Failed to prepare statement for parsing.".to_string();
+                    self.status_message = "Failed to prepare insert statement.".to_string();
+                    return;
+                }
+            };
+
+            let mut delete_stmt = match tx.prepare("DELETE FROM files WHERE file_hash = ?") {
+                Ok(s) => s,
+                Err(_) => {
+                    self.status_message = "Failed to prepare delete statement.".to_string();
                     return;
                 }
             };
 
             for mut file_info in all_files {
+                // Verify if the file or directory still exists physically on disk
+                if !file_info.path.exists() {
+                    let _ = delete_stmt.execute(params![file_info.file_hash]);
+                    removed_count += 1;
+                    continue;
+                }
+
+                // Parse or refresh metadata for files that are marked 'scanned' or if you want a complete re-check
                 if file_info.tags.iter().any(|t| t == "scanned") {
                     self.refresh_file_metadata(&mut file_info);
-
-                    self.status_message = format!("Parsing: {}", file_info.name);
 
                     let extra_json =
                         serde_json::to_string(&file_info.extra_details).unwrap_or_default();
                     let tags_json = serde_json::to_string(&file_info.tags).unwrap_or_default();
 
-                    let _ = stmt.execute(params![
+                    let _ = insert_stmt.execute(params![
                         file_info.file_hash,
                         file_info.path.to_string_lossy().to_string(),
                         file_info.name,
@@ -575,22 +623,31 @@ impl FileInspectorApp {
                         tags_json
                     ]);
 
-                    count += 1;
+                    parsed_count += 1;
                 }
             }
         }
 
         if tx.commit().is_ok() {
-            self.status_message = format!("Successfully parsed {} scanned files.", count);
+            self.status_message = format!(
+                "Parse complete: Updated {} file(s), removed {} missing file(s) from DB.",
+                parsed_count, removed_count
+            );
         } else {
-            self.status_message = "Failed to commit parsed files transaction.".to_string();
+            self.status_message = "Failed to commit database transaction.".to_string();
         }
 
+        // Refresh currently viewed file state if applicable
         if let Some(curr) = &self.current_file {
             let h = curr.file_hash.clone();
-            self.current_file = self.get_from_db(&h);
-            if let Some(c) = &self.current_file {
-                self.tag_input_buffer = c.tags.join(", ");
+            if !curr.path.exists() {
+                self.current_file = None;
+                self.tag_input_buffer.clear();
+            } else {
+                self.current_file = self.get_from_db(&h);
+                if let Some(c) = &self.current_file {
+                    self.tag_input_buffer = c.tags.join(", ");
+                }
             }
         }
     }
@@ -640,7 +697,6 @@ impl FileInspectorApp {
             let (dir_size, file_count, folder_count) = calculate_dir_stats(&path);
             let dir_hash = format!("dir_{}", path.to_string_lossy());
 
-            // Check if directory is already indexed and matches size, file count, and folder count
             if let Some(mut existing_dir) = self.get_from_db(&dir_hash) {
                 let mut existing_file_count = 0;
                 let mut existing_folder_count = 0;
@@ -657,8 +713,6 @@ impl FileInspectorApp {
                     && existing_file_count == file_count
                     && existing_folder_count == folder_count
                 {
-                    // Match found: skip re-indexing
-                    // Ensure "scanned" is removed/replaced with "parsed" if applicable
                     let mut updated = false;
                     if let Some(pos) = existing_dir.tags.iter().position(|t| t == "scanned") {
                         existing_dir.tags.remove(pos);
@@ -679,7 +733,6 @@ impl FileInspectorApp {
                 }
             }
 
-            // Otherwise, proceed with background indexing as normal
             let extra_details = vec![
                 ("Number of Files".into(), file_count.to_string()),
                 ("Number of Folders".into(), folder_count.to_string()),
@@ -745,13 +798,9 @@ impl FileInspectorApp {
         };
 
         if let Some(mut cached_info) = self.get_from_db(&file_hash) {
-            // If it was previously scanned, parsing it now removes "scanned" and assigns "parsed"
             let mut updated = false;
             if let Some(pos) = cached_info.tags.iter().position(|t| t == "scanned") {
                 cached_info.tags.remove(pos);
-                // if !cached_info.tags.contains(&"parsed".to_string()) {
-                //     cached_info.tags.push("parsed".to_string());
-                // }
                 updated = true;
             }
             if updated {
@@ -786,12 +835,7 @@ impl FileInspectorApp {
             ("unknown".into(), "unknown".into())
         };
 
-        let initial_tags = vec![
-            file_type.clone(),
-            // "parsed".to_string(),
-            month.clone(),
-            year.clone(),
-        ];
+        let initial_tags = vec![file_type.clone(), month.clone(), year.clone()];
 
         let created_at = metadata
             .created()
@@ -1469,6 +1513,15 @@ impl eframe::App for FileInspectorApp {
                     }
                 });
 
+                // Added NOT query input row
+                ui.horizontal(|ui| {
+                    ui.label("🚫 NOT:");
+                    ui.add(egui::TextEdit::singleline(&mut self.not_query).desired_width(203.0));
+                    if !self.not_query.is_empty() && ui.button("Clear").clicked() {
+                        self.not_query.clear();
+                    }
+                });
+
                 ui.add_space(6.0);
                 ui.strong("Search Results");
                 ui.add_space(4.0);
@@ -1491,6 +1544,13 @@ impl eframe::App for FileInspectorApp {
 
                 let or_terms: Vec<String> = self
                     .or_query
+                    .split(',')
+                    .map(|s| s.trim().to_lowercase())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+
+                let not_terms: Vec<String> = self
+                    .not_query
                     .split(',')
                     .map(|s| s.trim().to_lowercase())
                     .filter(|s| !s.is_empty())
@@ -1521,14 +1581,29 @@ impl eframe::App for FileInspectorApp {
                             return false;
                         }
 
+                        // Exclude matches that satisfy any NOT term
+                        if !not_terms.is_empty() && not_terms.iter().any(|t| matches_term(t)) {
+                            return false;
+                        }
+
                         true
                     })
                     .cloned()
                     .collect();
 
-                if !matches.is_empty() && ui.button("📤 Export Current Results").clicked() {
-                    self.export_to_json(&matches, "search_results");
-                }
+                ui.horizontal(|ui| {
+                    if !matches.is_empty() {
+                        if ui.button("📤 Export Results").clicked() {
+                            self.export_to_json(&matches, "search_results");
+                        }
+                        // Added Delete from DB button for the filtered list
+                        if ui.button("🗑️ Delete from DB").clicked() {
+                            let hashes_to_delete: Vec<String> =
+                                matches.iter().map(|m| m.file_hash.clone()).collect();
+                            self.delete_hashes_from_db(&hashes_to_delete);
+                        }
+                    }
+                });
 
                 ui.add_space(4.0);
 
